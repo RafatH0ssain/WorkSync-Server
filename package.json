@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mongodb": "5.5"
+  },
+  "name": "worksync---server",
+  "version": "1.0.0",
+  "description": "\"# b10a12-server-side-RafatH0ssain\"",
+  "main": "index.js",
+  "devDependencies": {},
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
