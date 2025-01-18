@@ -3,12 +3,22 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 const port = process.env.PORT || 5000;
-const { MongoClient, ServerApiVersion } = require('mongodb');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+// Add this at the start of your backend file to verify env variables
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PW}@cluster0.oyqb2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
+    credentials: true
+}));
 app.use(express.json());
+
+// Add this before your routes
+app.use((err, req, res, next) => {
+    console.error(err.stack);
+    res.status(500).json({ error: 'Something broke!' });
+});
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
@@ -19,21 +29,110 @@ const client = new MongoClient(uri, {
     }
 });
 
+const db = client.db("WorkSync");
+const allUsersCollection = db.collection("Users");
+const adminCollection = db.collection("AdminUsers");
+const hrCollection = db.collection("HRUsers");
+const employeeCollection = db.collection("EmployeeUsers");
+
 async function run() {
     try {
-        // Connect the client to the server	(optional starting in v4.7)
         await client.connect();
-        // Send a ping to confirm a successful connection
-        await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
-        // You can now start listening to requests
+
+        // Test the connection
+        const pingResult = await client.db("admin").command({ ping: 1 });
+        console.log("MongoDB connection successful!", pingResult);
+
+        // Start the server only after successful connection
         app.listen(port, () => {
             console.log(`Server running on PORT: ${port}`);
         });
+
+        // Add this after your MongoDB connection
+        const db = client.db("WorkSync");
+        const collections = {
+            allUsers: db.collection("Users"),
+            admin: db.collection("AdminUsers"),
+            hr: db.collection("HRUsers"),
+            employee: db.collection("EmployeeUsers")
+        };
+
+        // Remove this line since uid is not defined here
+        // const user = await collections.allUsers.findOne({ uid: uid });
     }
-    catch {
+    catch (error) {
         console.error("Error connecting to MongoDB:", error);
         process.exit(1);
     }
 }
+
+// Add this for proper cleanup
+process.on('SIGINT', async () => {
+    await client.close();
+    process.exit();
+});
+
+// GET method for getting the current logged in user
+app.get('/users/:uid', async (req, res) => {
+    const { uid } = req.params;
+
+    try {
+        const user = await allUsersCollection.findOne({ uid: uid });
+        if (user) {
+            res.status(200).json(user);
+        } else {
+            res.status(404).json({ error: 'No record found with that UID' });
+        }
+    } catch (error) {
+        console.error('Error fetching user:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+app.post('/users', async (req, res) => {
+    const { name, email, photoURL, uid, userType } = req.body;
+
+    try {
+        // Check if the user already exists
+        const existingUser = await allUsersCollection.findOne({ email });
+        if (existingUser) {
+            return res.status(400).json({ message: "User already exists!" });
+        }
+
+        // Prepare the new user object, without the _id field as MongoDB generates it automatically
+        const newUser = {
+            name,
+            email,
+            photoURL,
+            uid,
+            userType,
+            createdAt: new Date(),  // Ensure this is stored as a Date object
+        };
+
+        // Insert the user into the appropriate collection based on userType
+        let collection;
+        switch (newUser.userType) {
+            case "admin":
+                collection = adminCollection;
+                break;
+            case "hr":
+                collection = hrCollection;
+                break;
+            case "employee":
+            default:
+                collection = employeeCollection;
+                break;
+        }
+
+        // Insert the new user into the correct collection
+        await collection.insertOne(newUser);
+        await allUsersCollection.insertOne(newUser);
+
+        res.status(201).json({ message: "User registered successfully!" });
+    } catch (error) {
+        console.error("Error saving user:", error);
+        res.status(500).json({ message: "Internal server error" });
+    }
+});
+
 run().catch(console.dir);
