@@ -89,6 +89,22 @@ app.get('/users/:uid', async (req, res) => {
     }
 });
 
+// GET method for getting all users excluding admin
+app.get('/users', async (req, res) => {
+    try {
+        // Fetch all users except those with userType 'admin'
+        const users = await allUsersCollection.find({ userType: { $ne: "admin" } }).toArray();
+        if (users.length > 0) {
+            res.status(200).json(users);
+        } else {
+            res.status(404).json({ error: 'No users found' });
+        }
+    } catch (error) {
+        console.error('Error fetching users:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
 app.post('/users', async (req, res) => {
     const { name, email, photoURL, uid, userType } = req.body;
 
@@ -134,5 +150,7 @@ app.post('/users', async (req, res) => {
         res.status(500).json({ message: "Internal server error" });
     }
 });
+
+
 
 run().catch(console.dir);
