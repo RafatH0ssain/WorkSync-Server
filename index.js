@@ -29,6 +29,14 @@ const client = new MongoClient(uri, {
     }
 });
 
+const admin = require('firebase-admin');
+const serviceAccount = require('./worksync-2ca3b-firebase-adminsdk-sxxrh-0adbd0d0d3.json'); // Ensure this is the correct path to your service account key
+
+// Initialize Firebase Admin SDK with service account
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+});
+
 const db = client.db("WorkSync");
 const allUsersCollection = db.collection("Users");
 const adminCollection = db.collection("AdminUsers");
@@ -151,27 +159,126 @@ app.post('/users', async (req, res) => {
     }
 });
 
-const firebaseAdmin = require('firebase-admin');
-firebaseAdmin.initializeApp({
-    credential: firebaseAdmin.credential.applicationDefault()
-});
+// const firebaseAdmin = require('firebase-admin');
+// firebaseAdmin.initializeApp({
+//     credential: firebaseAdmin.credential.applicationDefault()
+// });
 
-app.post('/fire/:id', async (req, res) => {
-    const userId = req.params.id;
+// Modify the fire endpoint in your backend
+app.post('/fire/:uid', async (req, res) => {
+    const userId = req.params.uid;
 
     try {
-        // Verify the userId is passed correctly
         if (!userId) {
             return res.status(400).json({ error: 'No user ID provided' });
         }
 
-        // Try to disable the Firebase user
-        await firebaseAdmin.auth().updateUser(userId, { disabled: true });
+        console.log('Firing user:', userId);
+
+        // First find the user to determine their type
+        const user = await allUsersCollection.findOne({ uid: userId });
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Determine which specific collection to update based on user type
+        let specificCollection;
+        switch (user.userType?.toLowerCase()) {
+            case 'hr':
+                specificCollection = hrCollection;
+                break;
+            case 'admin':
+                specificCollection = adminCollection;
+                break;
+            case 'employee':
+            default:
+                specificCollection = employeeCollection;
+                break;
+        }
+
+        // Update both the specific collection and the main Users collection
+        const updatePromises = [
+            // Update in specific collection (HR, Admin, or Employee)
+            specificCollection.updateOne(
+                { uid: userId },
+                { $set: { status: 'fired' } }
+            ),
+            // Update in main Users collection
+            allUsersCollection.updateOne(
+                { uid: userId },
+                { $set: { status: 'fired' } }
+            )
+        ];
+
+        await Promise.all(updatePromises);
+
+        // Fetch the updated user to verify the change
+        const updatedUser = await allUsersCollection.findOne({ uid: userId });
+        
+        // Fetch the updated lists to send back to frontend
+        const updatedUsers = await allUsersCollection.find({}).toArray();
+
+        res.status(200).json({ 
+            message: 'User fired successfully', 
+            user: updatedUser,
+            updatedUsers: updatedUsers 
+        });
+
+    } catch (error) {
+        console.error('Error firing user:', error);
+        res.status(500).json({ error: `Error firing user: ${error.message}` });
+    }
+});
+
+// Add a new endpoint to check user status during login
+app.get('/check-user-status/:uid', async (req, res) => {
+    const userId = req.params.uid;
+
+    try {
+        const user = await allUsersCollection.findOne({ uid: userId });
+        
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.status(200).json({ 
+            status: user.status || 'active',
+            userType: user.userType 
+        });
+    } catch (error) {
+        console.error('Error checking user status:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.post('/fire/:uid', async (req, res) => {
+    const userId = req.params.uid; // Get userId from URL params
+
+    try {
+        if (!userId) {
+            return res.status(400).json({ error: 'No user ID provided' });
+        }
+
+        console.log('Firing user:', userId);
+
+        // Access the users collection in MongoDB
+        const collection = db.collection('users'); // Adjust collection name if needed
+
+        // Find the employee by UID and update their status
+        const result = await collection.updateOne(
+            { uid: userId },
+            { $set: { status: 'fired' } }
+        );
+
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ error: 'Employee not found or already fired' });
+        }
 
         res.status(200).send('User fired successfully');
     } catch (error) {
-        console.error('Error firing user:', error);
-        res.status(500).json({ error: 'Error firing user' });
+        console.error('Error firing user:', error); // Log the full error
+        res.status(500).json({ error: `Error firing user: ${error.message}` });
     }
 });
 
