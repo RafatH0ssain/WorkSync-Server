@@ -177,7 +177,7 @@ app.post('/fire/:uid', async (req, res) => {
 
         // First find the user to determine their type
         const user = await allUsersCollection.findOne({ uid: userId });
-        
+
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -215,14 +215,14 @@ app.post('/fire/:uid', async (req, res) => {
 
         // Fetch the updated user to verify the change
         const updatedUser = await allUsersCollection.findOne({ uid: userId });
-        
+
         // Fetch the updated lists to send back to frontend
         const updatedUsers = await allUsersCollection.find({}).toArray();
 
-        res.status(200).json({ 
-            message: 'User fired successfully', 
+        res.status(200).json({
+            message: 'User fired successfully',
             user: updatedUser,
-            updatedUsers: updatedUsers 
+            updatedUsers: updatedUsers
         });
 
     } catch (error) {
@@ -237,14 +237,14 @@ app.get('/check-user-status/:uid', async (req, res) => {
 
     try {
         const user = await allUsersCollection.findOne({ uid: userId });
-        
+
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        res.status(200).json({ 
+        res.status(200).json({
             status: user.status || 'active',
-            userType: user.userType 
+            userType: user.userType
         });
     } catch (error) {
         console.error('Error checking user status:', error);
@@ -252,44 +252,139 @@ app.get('/check-user-status/:uid', async (req, res) => {
     }
 });
 
+// Enhanced make-hr endpoint
+app.post('/make-hr/:id', async (req, res) => {
+    const userId = req.params.id;
+
+    try {
+        // First, find the user in the main Users collection
+        const user = await allUsersCollection.findOne({ _id: new ObjectId(userId) });
+
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Create user object for HR collection
+        const hrUser = {
+            ...user,
+            userType: 'hr',
+            promotedAt: new Date()
+        };
+
+        // Start a session for transaction
+        const session = client.startSession();
+
+        try {
+            await session.withTransaction(async () => {
+                // Remove from employee collection if they were an employee
+                if (user.userType === 'employee') {
+                    await employeeCollection.deleteOne({ _id: new ObjectId(userId) }, { session });
+                }
+
+                // Insert into HR collection
+                await hrCollection.insertOne(hrUser, { session });
+
+                // Update main Users collection
+                await allUsersCollection.updateOne(
+                    { _id: new ObjectId(userId) },
+                    {
+                        $set: {
+                            userType: 'hr',
+                            promotedAt: new Date()
+                        }
+                    },
+                    { session }
+                );
+            });
+
+            // Fetch updated user list
+            const updatedUsers = await allUsersCollection
+                .find({ userType: { $ne: "admin" } })
+                .toArray();
+
+            res.status(200).json({
+                message: 'User successfully promoted to HR',
+                updatedUsers: updatedUsers
+            });
+
+        } finally {
+            await session.endSession();
+        }
+
+    } catch (error) {
+        console.error('Error promoting user to HR:', error);
+        res.status(500).json({ error: 'Internal server error while promoting user' });
+    }
+});
+
+// Enhanced fire endpoint
 app.post('/fire/:uid', async (req, res) => {
-    const userId = req.params.uid; // Get userId from URL params
+    const userId = req.params.uid;
 
     try {
         if (!userId) {
             return res.status(400).json({ error: 'No user ID provided' });
         }
 
-        console.log('Firing user:', userId);
+        // Find the user first
+        const user = await allUsersCollection.findOne({ uid: userId });
 
-        // Access the users collection in MongoDB
-        const collection = db.collection('users'); // Adjust collection name if needed
-
-        // Find the employee by UID and update their status
-        const result = await collection.updateOne(
-            { uid: userId },
-            { $set: { status: 'fired' } }
-        );
-
-        if (result.modifiedCount === 0) {
-            return res.status(404).json({ error: 'Employee not found or already fired' });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
         }
 
-        res.status(200).send('User fired successfully');
-    } catch (error) {
-        console.error('Error firing user:', error); // Log the full error
-        res.status(500).json({ error: `Error firing user: ${error.message}` });
-    }
-});
+        // Start a session for transaction
+        const session = client.startSession();
 
-app.post('/make-hr/:id', async (req, res) => {
-    const userId = req.params.id;
-    try {
-        // Update user type to HR in the database
-        await updateUserType(userId, 'hr');
-        res.status(200).send('User made HR');
+        try {
+            await session.withTransaction(async () => {
+                // Update in specific collection based on user type
+                const specificCollection = user.userType === 'hr' ? hrCollection : employeeCollection;
+
+                await specificCollection.updateOne(
+                    { uid: userId },
+                    {
+                        $set: {
+                            status: 'fired',
+                            firedAt: new Date(),
+                            previousRole: user.userType
+                        }
+                    },
+                    { session }
+                );
+
+                // Update in main Users collection
+                await allUsersCollection.updateOne(
+                    { uid: userId },
+                    {
+                        $set: {
+                            status: 'fired',
+                            firedAt: new Date(),
+                            previousRole: user.userType,
+                            userType: 'terminated'  // Optional: you might want to change the userType
+                        }
+                    },
+                    { session }
+                );
+            });
+
+            // Fetch updated user list
+            const updatedUsers = await allUsersCollection
+                .find({ userType: { $ne: "admin" } })
+                .toArray();
+
+            res.status(200).json({
+                message: 'User fired successfully',
+                updatedUsers: updatedUsers
+            });
+
+        } finally {
+            await session.endSession();
+        }
+
     } catch (error) {
-        res.status(500).send('Error making user HR');
+        console.error('Error firing user:', error);
+        res.status(500).json({ error: 'Internal server error while firing user' });
     }
 });
 
