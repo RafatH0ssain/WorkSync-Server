@@ -151,6 +151,51 @@ app.post('/users', async (req, res) => {
     }
 });
 
+const firebaseAdmin = require('firebase-admin');
+firebaseAdmin.initializeApp({
+    credential: firebaseAdmin.credential.applicationDefault()
+});
 
+app.post('/fire/:id', async (req, res) => {
+    const userId = req.params.id;
+
+    try {
+        // Verify the userId is passed correctly
+        if (!userId) {
+            return res.status(400).json({ error: 'No user ID provided' });
+        }
+
+        // Try to disable the Firebase user
+        await firebaseAdmin.auth().updateUser(userId, { disabled: true });
+
+        res.status(200).send('User fired successfully');
+    } catch (error) {
+        console.error('Error firing user:', error);
+        res.status(500).json({ error: 'Error firing user' });
+    }
+});
+
+app.post('/make-hr/:id', async (req, res) => {
+    const userId = req.params.id;
+    try {
+        // Update user type to HR in the database
+        await updateUserType(userId, 'hr');
+        res.status(200).send('User made HR');
+    } catch (error) {
+        res.status(500).send('Error making user HR');
+    }
+});
+
+app.post('/adjust-salary/:id', async (req, res) => {
+    const userId = req.params.id;
+    const { salary } = req.body;
+    try {
+        // Update salary in the database
+        await adjustSalary(userId, salary);
+        res.status(200).send('Salary adjusted');
+    } catch (error) {
+        res.status(500).send('Error adjusting salary');
+    }
+});
 
 run().catch(console.dir);
