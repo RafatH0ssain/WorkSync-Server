@@ -42,6 +42,7 @@ const allUsersCollection = db.collection("Users");
 const adminCollection = db.collection("AdminUsers");
 const hrCollection = db.collection("HRUsers");
 const employeeCollection = db.collection("EmployeeUsers");
+const employeePaymentCollection = db.collection("EmployeePayments");
 
 async function run() {
     try {
@@ -317,77 +318,6 @@ app.post('/make-hr/:id', async (req, res) => {
     }
 });
 
-// Enhanced fire endpoint
-app.post('/fire/:uid', async (req, res) => {
-    const userId = req.params.uid;
-
-    try {
-        if (!userId) {
-            return res.status(400).json({ error: 'No user ID provided' });
-        }
-
-        // Find the user first
-        const user = await allUsersCollection.findOne({ uid: userId });
-
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        // Start a session for transaction
-        const session = client.startSession();
-
-        try {
-            await session.withTransaction(async () => {
-                // Update in specific collection based on user type
-                const specificCollection = user.userType === 'hr' ? hrCollection : employeeCollection;
-
-                await specificCollection.updateOne(
-                    { uid: userId },
-                    {
-                        $set: {
-                            status: 'fired',
-                            firedAt: new Date(),
-                            previousRole: user.userType
-                        }
-                    },
-                    { session }
-                );
-
-                // Update in main Users collection
-                await allUsersCollection.updateOne(
-                    { uid: userId },
-                    {
-                        $set: {
-                            status: 'fired',
-                            firedAt: new Date(),
-                            previousRole: user.userType,
-                            userType: 'terminated'  // Optional: you might want to change the userType
-                        }
-                    },
-                    { session }
-                );
-            });
-
-            // Fetch updated user list
-            const updatedUsers = await allUsersCollection
-                .find({ userType: { $ne: "admin" } })
-                .toArray();
-
-            res.status(200).json({
-                message: 'User fired successfully',
-                updatedUsers: updatedUsers
-            });
-
-        } finally {
-            await session.endSession();
-        }
-
-    } catch (error) {
-        console.error('Error firing user:', error);
-        res.status(500).json({ error: 'Internal server error while firing user' });
-    }
-});
-
 app.post('/adjust-salary/:id', async (req, res) => {
     const userId = req.params.id;
     const { salary } = req.body;
@@ -397,6 +327,104 @@ app.post('/adjust-salary/:id', async (req, res) => {
         res.status(200).send('Salary adjusted');
     } catch (error) {
         res.status(500).send('Error adjusting salary');
+    }
+});
+
+// Add these routes to your backend file
+
+// Toggle employee verification status
+app.post('/toggle-verification/:id', async (req, res) => {
+    const { id } = req.params;
+    const { isVerified } = req.body;
+
+    try {
+        const result = await allUsersCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: { isVerified } }
+        );
+
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ error: 'Employee not found' });
+        }
+
+        res.status(200).json({ message: 'Verification status updated successfully' });
+    } catch (error) {
+        console.error('Error updating verification status:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Create payment request
+app.post('/payment-requests', async (req, res) => {
+    try {
+        const paymentRequest = {
+            ...req.body,
+            requestDate: new Date(),
+            status: 'pending',
+            requestedBy: req.body.hrId, // ID of HR making request
+        };
+
+        // Create payment requests collection if it doesn't exist
+        const paymentRequestsCollection = db.collection("PaymentRequests");
+
+        const result = await paymentRequestsCollection.insertOne(paymentRequest);
+
+        if (!result.insertedId) {
+            throw new Error('Failed to create payment request');
+        }
+
+        res.status(201).json({
+            message: 'Payment request created successfully',
+            requestId: result.insertedId
+        });
+    } catch (error) {
+        console.error('Error creating payment request:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get salary history for an employee
+app.get('/salary-history/:id', async (req, res) => {
+    try {
+        const paymentRequestsCollection = db.collection("PaymentRequests");
+
+        // Get approved payments for the employee
+        const salaryHistory = await paymentRequestsCollection
+            .find({
+                employeeId: req.params.id,
+                status: 'approved'
+            })
+            .sort({ year: 1, month: 1 })
+            .toArray();
+
+        // Transform data for the chart
+        const formattedHistory = salaryHistory.map(payment => ({
+            month: `${payment.month} ${payment.year}`,
+            salary: payment.salary
+        }));
+
+        res.status(200).json(formattedHistory);
+    } catch (error) {
+        console.error('Error fetching salary history:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Get employee details by ID
+app.get('/users/:id', async (req, res) => {
+    try {
+        const user = await allUsersCollection.findOne({
+            _id: new ObjectId(req.params.id)
+        });
+
+        if (!user) {
+            return res.status(404).json({ error: 'Employee not found' });
+        }
+
+        res.status(200).json(user);
+    } catch (error) {
+        console.error('Error fetching employee details:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
