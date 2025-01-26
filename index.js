@@ -42,7 +42,8 @@ const allUsersCollection = db.collection("Users");
 const adminCollection = db.collection("AdminUsers");
 const hrCollection = db.collection("HRUsers");
 const employeeCollection = db.collection("EmployeeUsers");
-const employeePaymentCollection = db.collection("EmployeePayments");
+const paymentRequestsCollection = db.collection("PaymentRequests");
+const worksheetCollection = db.collection("EmployeeWorksheets");
 
 async function run() {
     try {
@@ -75,7 +76,7 @@ async function run() {
     }
 }
 
-// Add this for proper cleanup
+// Proper cleanup
 process.on('SIGINT', async () => {
     await client.close();
     process.exit();
@@ -159,11 +160,6 @@ app.post('/users', async (req, res) => {
         res.status(500).json({ message: "Internal server error" });
     }
 });
-
-// const firebaseAdmin = require('firebase-admin');
-// firebaseAdmin.initializeApp({
-//     credential: firebaseAdmin.credential.applicationDefault()
-// });
 
 // Modify the fire endpoint in your backend
 app.post('/fire/:uid', async (req, res) => {
@@ -330,8 +326,6 @@ app.post('/adjust-salary/:id', async (req, res) => {
     }
 });
 
-// Add these routes to your backend file
-
 // Toggle employee verification status
 app.post('/toggle-verification/:id', async (req, res) => {
     const { id } = req.params;
@@ -354,40 +348,9 @@ app.post('/toggle-verification/:id', async (req, res) => {
     }
 });
 
-// Create payment request
-app.post('/payment-requests', async (req, res) => {
-    try {
-        const paymentRequest = {
-            ...req.body,
-            requestDate: new Date(),
-            status: 'pending',
-            requestedBy: req.body.hrId, // ID of HR making request
-        };
-
-        // Create payment requests collection if it doesn't exist
-        const paymentRequestsCollection = db.collection("PaymentRequests");
-
-        const result = await paymentRequestsCollection.insertOne(paymentRequest);
-
-        if (!result.insertedId) {
-            throw new Error('Failed to create payment request');
-        }
-
-        res.status(201).json({
-            message: 'Payment request created successfully',
-            requestId: result.insertedId
-        });
-    } catch (error) {
-        console.error('Error creating payment request:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
 // Get salary history for an employee
 app.get('/salary-history/:id', async (req, res) => {
     try {
-        const paymentRequestsCollection = db.collection("PaymentRequests");
-
         // Get approved payments for the employee
         const salaryHistory = await paymentRequestsCollection
             .find({
@@ -410,21 +373,173 @@ app.get('/salary-history/:id', async (req, res) => {
     }
 });
 
-// Get employee details by ID
-app.get('/users/:id', async (req, res) => {
+// Endpoint to add a new worksheet entry
+app.post('/worksheet', async (req, res) => {
     try {
-        const user = await allUsersCollection.findOne({
-            _id: new ObjectId(req.params.id)
+        const worksheetEntry = {
+            ...req.body,
+            createdAt: new Date()
+        };
+        const result = await worksheetCollection.insertOne(worksheetEntry);
+        if (!result.insertedId) {
+            throw new Error('Failed to create worksheet entry');
+        }
+        res.status(201).json({
+            message: 'Worksheet entry created successfully',
+            entry: { ...worksheetEntry, _id: result.insertedId }
         });
+    } catch (error) {
+        console.error('Error creating worksheet entry:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
-        if (!user) {
-            return res.status(404).json({ error: 'Employee not found' });
+// Endpoint to get worksheet entries for a specific employee
+app.get('/worksheet/:email', async (req, res) => {
+    try {
+        const entries = await worksheetCollection
+            .find({ email: req.params.email })
+            .sort({ date: -1 })
+            .toArray();
+        res.status(200).json(entries);
+    } catch (error) {
+        console.error('Error fetching worksheet entries:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Endpoint to update a worksheet entry
+app.put('/worksheet/:id', async (req, res) => {
+    try {
+        // Ensure that we're not modifying the _id field itself (it should stay as-is)
+        const { _id, ...updateFields } = req.body;
+
+        // Proceed with the update, ensuring the _id remains unchanged
+        const result = await worksheetCollection.updateOne(
+            { _id: new ObjectId(req.params.id) }, // Match the document by _id
+            { $set: updateFields } // Only set the fields provided, excluding _id
+        );
+
+        // Check if any document was modified
+        if (result.modifiedCount === 0) {
+            return res.status(404).json({ error: 'Entry not found or no changes made' });
         }
 
-        res.status(200).json(user);
+        res.status(200).json({ message: 'Entry updated successfully' });
     } catch (error) {
-        console.error('Error fetching employee details:', error);
+        console.error('Error updating worksheet entry:', error);
         res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Endpoint to delete a worksheet entry
+app.delete('/worksheet/:id', async (req, res) => {
+    try {
+        const result = await worksheetCollection.deleteOne({
+            _id: new ObjectId(req.params.id)
+        });
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ error: 'Entry not found' });
+        }
+        res.status(200).json({ message: 'Entry deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting worksheet entry:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Modified salary history endpoint with pagination
+app.get('/payment-history/:uid', async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 5;
+        const skip = (page - 1) * limit;
+        const paymentHistory = await paymentRequestsCollection
+            .find({ employeeId: req.params.uid })
+            .sort({ year: -1, month: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray();
+        const total = await paymentRequestsCollection
+            .countDocuments({ employeeId: req.params.uid });
+        res.status(200).json({
+            payments: paymentHistory,
+            currentPage: page,
+            totalPages: Math.ceil(total / limit),
+            totalEntries: total
+        });
+    } catch (error) {
+        console.error('Error fetching payment history:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// New endpoint to get total amount owed to employee (worksheetcollection)
+app.get('/employee-owed/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+
+        // Get all worksheet entries for the employee
+        const worksheetEntries = await worksheetCollection.find({
+            email: email,
+            paid: { $exists: false } // Only get unpaid entries
+        }).toArray();
+
+        // Calculate total amount (hours × $20)
+        const totalOwed = worksheetEntries.reduce((acc, entry) => {
+            return acc + (Number(entry.hoursWorked) * 20);
+        }, 0);
+
+        // Get total hours
+        const totalHours = worksheetEntries.reduce((acc, entry) => {
+            return acc + Number(entry.hoursWorked);
+        }, 0);
+
+        res.status(200).json({
+            totalOwed,
+            totalHours,
+            entries: worksheetEntries
+        });
+    } catch (error) {
+        console.error('Error calculating amount owed:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// New endpoint to process payment
+app.post('/process-payment', async (req, res) => {
+    const { email, amount, paidBy, entries } = req.body;
+
+    const session = client.startSession();
+
+    try {
+        await session.withTransaction(async () => {
+            // Create payment record
+            const paymentRecord = {
+                email,
+                amount,
+                paidBy,
+                paidDate: new Date(),
+                status: 'paid',
+                entries: entries // Store the worksheet entries that were paid
+            };
+
+            await paymentRequestsCollection.insertOne(paymentRecord, { session });
+
+            // Delete the paid worksheet entries
+            const entryIds = entries.map(entry => new ObjectId(entry._id));
+            await worksheetCollection.deleteMany(
+                { _id: { $in: entryIds } },
+                { session }
+            );
+        });
+
+        res.status(200).json({ message: 'Payment processed successfully' });
+    } catch (error) {
+        console.error('Error processing payment:', error);
+        res.status(500).json({ error: 'Failed to process payment' });
+    } finally {
+        await session.endSession();
     }
 });
 
