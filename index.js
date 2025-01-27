@@ -449,24 +449,17 @@ app.delete('/worksheet/:id', async (req, res) => {
 });
 
 // Modified salary history endpoint with pagination
-app.get('/payment-history/:uid', async (req, res) => {
+app.get('/payment-history', async (req, res) => {
     try {
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 5;
-        const skip = (page - 1) * limit;
+        // Fetch all payment requests from the collection
         const paymentHistory = await paymentRequestsCollection
-            .find({ employeeId: req.params.uid })
-            .sort({ year: -1, month: -1 })
-            .skip(skip)
-            .limit(limit)
+            .find() // No need for the email filter
+            .sort({ paidDate: -1 }) // Sorting by payment date, descending
             .toArray();
-        const total = await paymentRequestsCollection
-            .countDocuments({ employeeId: req.params.uid });
+
         res.status(200).json({
             payments: paymentHistory,
-            currentPage: page,
-            totalPages: Math.ceil(total / limit),
-            totalEntries: total
+            totalEntries: paymentHistory.length
         });
     } catch (error) {
         console.error('Error fetching payment history:', error);
@@ -474,39 +467,73 @@ app.get('/payment-history/:uid', async (req, res) => {
     }
 });
 
+
 // New endpoint to get total amount owed to employee (worksheetcollection)
 app.get('/employee-owed/:email', async (req, res) => {
     try {
         const { email } = req.params;
 
-        // Get all worksheet entries for the employee
+        // Get all worksheet entries
         const worksheetEntries = await worksheetCollection.find({
-            email: email,
-            paid: { $exists: false } // Only get unpaid entries
+            email: email
         }).toArray();
 
-        // Calculate total amount (hours × $20)
-        const totalOwed = worksheetEntries.reduce((acc, entry) => {
-            return acc + (Number(entry.hoursWorked) * 20);
-        }, 0);
+        // Get all payment history
+        const paymentHistory = await paymentRequestsCollection.find({
+            email: email
+        }).toArray();
 
-        // Get total hours
+        // Check for pending payments
+        const pendingPayment = await paymentRequestsCollection.findOne({
+            email: email,
+            status: 'pending'
+        });
+
+        // Calculate total hours worked
         const totalHours = worksheetEntries.reduce((acc, entry) => {
             return acc + Number(entry.hoursWorked);
         }, 0);
 
+        // Get paid entries IDs from payment history
+        const paidEntryIds = paymentHistory
+            .filter(payment => payment.status === 'paid')
+            .flatMap(payment => payment.entries || [])
+            .map(entry => entry._id.toString());
+
+        // Calculate total paid amount
+        const totalPaid = paymentHistory
+            .filter(payment => payment.status === 'paid')
+            .reduce((acc, payment) => acc + Number(payment.amount), 0);
+
+        // Calculate amount owed (only from unpaid entries)
+        const totalOwed = (worksheetEntries
+            .filter(entry => !paidEntryIds.includes(entry._id.toString()))
+            .reduce((acc, entry) => acc + (Number(entry.hoursWorked) * 20), 0)) - totalPaid;
+
+        // Get the latest paid payment for salary
+        const latestPaidPayment = paymentHistory
+            .filter(payment => payment.status === 'paid')
+            .sort((a, b) => new Date(b.paidDate) - new Date(a.paidDate))[0];
+
+        const salary = latestPaidPayment ? latestPaidPayment.amount : 0;
+
         res.status(200).json({
             totalOwed,
             totalHours,
-            entries: worksheetEntries
+            totalPaid,
+            salary,
+            hasPendingPayment: !!pendingPayment,
+            worksheetEntries: worksheetEntries.filter(entry =>
+                !paidEntryIds.includes(entry._id.toString())
+            )
         });
     } catch (error) {
-        console.error('Error calculating amount owed:', error);
+        console.error('Error calculating employee metrics:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// New endpoint to process payment
+// Endpoint to process payment
 app.post('/process-payment', async (req, res) => {
     const { email, amount, paidBy, entries } = req.body;
 
@@ -520,7 +547,7 @@ app.post('/process-payment', async (req, res) => {
                 amount,
                 paidBy,
                 paidDate: new Date(),
-                status: 'paid',
+                status: 'pending',
                 entries: entries // Store the worksheet entries that were paid
             };
 
@@ -538,6 +565,71 @@ app.post('/process-payment', async (req, res) => {
     } catch (error) {
         console.error('Error processing payment:', error);
         res.status(500).json({ error: 'Failed to process payment' });
+    } finally {
+        await session.endSession();
+    }
+});
+
+app.get('/check-pending-payment/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+
+        // Find any pending payments for this employee
+        const pendingPayment = await paymentRequestsCollection.findOne({
+            email: email,
+            status: 'pending'
+        });
+
+        res.status(200).json({
+            hasPendingPayment: !!pendingPayment,
+            pendingPayment: pendingPayment
+        });
+    } catch (error) {
+        console.error('Error checking pending payments:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Endpoint for admin to approve/reject payment requests
+app.put('/approve-payment/:paymentId', async (req, res) => {
+    const { paymentId } = req.params;
+    const { status } = req.body; // 'paid' or 'pending'
+
+    if (!['paid', 'pending'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status value. Must be "paid" or "pending".' });
+    }
+
+    const session = client.startSession();
+
+    try {
+        // Start a transaction to ensure consistency
+        await session.withTransaction(async () => {
+            const paymentRequest = await paymentRequestsCollection.findOne(
+                { _id: new ObjectId(paymentId) },
+                { session }
+            );
+
+            if (!paymentRequest) {
+                return res.status(404).json({ error: 'Payment request not found.' });
+            }
+
+            // Update the payment status
+            await paymentRequestsCollection.updateOne(
+                { _id: new ObjectId(paymentId) },
+                { $set: { status } },
+                { session }
+            );
+
+            // If payment is approved, you may also take additional actions like triggering a notification or logging.
+            if (status === 'paid') {
+                // Any logic to process once payment is approved (e.g., notify HR, employees, etc.)
+            }
+        });
+
+        res.status(200).json({ message: `Payment status updated to ${status}` });
+    } catch (error) {
+        console.error('Error updating payment status:', error);
+        res.status(500).json({ error: 'Failed to update payment status.' });
     } finally {
         await session.endSession();
     }
