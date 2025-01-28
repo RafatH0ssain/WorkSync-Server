@@ -432,6 +432,20 @@ app.put('/worksheet/:id', async (req, res) => {
     }
 });
 
+// Endpoint to get all worksheet entries
+app.get('/worksheet', async (req, res) => {
+    try {
+        const entries = await worksheetCollection
+            .find({})
+            .sort({ date: -1 })
+            .toArray();
+        res.status(200).json(entries);
+    } catch (error) {
+        console.error('Error fetching worksheet entries:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // Endpoint to delete a worksheet entry
 app.delete('/worksheet/:id', async (req, res) => {
     try {
