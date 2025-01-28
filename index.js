@@ -453,8 +453,8 @@ app.get('/payment-history', async (req, res) => {
     try {
         // Fetch all payment requests from the collection
         const paymentHistory = await paymentRequestsCollection
-            .find() // No need for the email filter
-            .sort({ paidDate: -1 }) // Sorting by payment date, descending
+            .find()
+            .sort({ paidDate: -1 })
             .toArray();
 
         res.status(200).json({
@@ -467,6 +467,89 @@ app.get('/payment-history', async (req, res) => {
     }
 });
 
+// Returns total of emplyee with email: email
+app.get('/payment-history/:email', async (req, res) => {
+    try {
+        const { email } = req.params; // Get email from the URL parameter
+
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' }); // Return error if email is not provided
+        }
+
+        // Fetch payment history filtered by email
+        const paymentHistory = await paymentRequestsCollection
+            .find({ email }) // Filter by email
+            .sort({ paidDate: -1 })
+            .toArray(); // Ensure toArray() is called to return an array
+
+        if (!paymentHistory || paymentHistory.length === 0) {
+            return res.status(404).json({ error: 'No payment history found for this email' });
+        }
+
+        // Transform the payment history into the desired format
+        const salaryHistory = paymentHistory.map(payment => {
+            // Extract month and year from paidDate
+            const paidDate = new Date(payment.paidDate);
+            const month = paidDate.toLocaleString('default', { month: 'long' });
+            const year = paidDate.getFullYear();
+
+            // Combine month and year for unique month-key
+            const monthKey = `${month}-${year}`;
+
+            // You can accumulate the total amount for the month if there are multiple payments in the same month
+            return {
+                month: monthKey,
+                salary: payment.amount, // The amount paid as the salary for this entry
+                approvedBy: payment.paidBy
+            };
+        });
+
+        // Group the payments by month (if multiple payments in the same month)
+        const groupedSalaryHistory = salaryHistory.reduce((acc, curr) => {
+            const existing = acc.find(item => item.month === curr.month);
+            if (existing) {
+                existing.salary += curr.salary; // Accumulate salary for the same month
+            } else {
+                acc.push(curr); // Add new month entry
+            }
+            return acc;
+        }, []);
+
+        // Return the transformed payment history data
+        res.status(200).json({
+            payments: groupedSalaryHistory,
+            totalEntries: groupedSalaryHistory.length
+        });
+    } catch (error) {
+        console.error('Error fetching payment history:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Returns array of payments for this employee
+app.get('/payment-historya/:email', async (req, res) => {
+    try {
+        const { email } = req.params; // Get email from the URL parameter
+
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' }); // Return error if email is not provided
+        }
+
+        // Fetch payment history filtered by email
+        const paymentHistory = await paymentRequestsCollection
+            .find({ email }) // Filter by email
+            .sort({ paidDate: -1 })
+            .toArray();
+
+        res.status(200).json({
+            payments: paymentHistory,
+            totalEntries: paymentHistory.length
+        });
+    } catch (error) {
+        console.error('Error fetching payment history:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 // New endpoint to get total amount owed to employee (worksheetcollection)
 app.get('/employee-owed/:email', async (req, res) => {
