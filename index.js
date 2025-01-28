@@ -44,6 +44,61 @@ const hrCollection = db.collection("HRUsers");
 const employeeCollection = db.collection("EmployeeUsers");
 const paymentRequestsCollection = db.collection("PaymentRequests");
 const worksheetCollection = db.collection("EmployeeWorksheets");
+const queriesCollection = db.collection("Queries");
+
+app.post('/submit-query', async (req, res) => {
+    try {
+        const { heading, designation, details, submittedAt, email } = req.body;
+
+        // Create query document
+        const queryDocument = {
+            heading,
+            designation,
+            details,
+            email,
+            status: 'pending',
+            submittedAt: new Date(submittedAt),
+            updatedAt: new Date()
+        };
+
+        // Insert into Queries collection
+        const result = await queriesCollection.insertOne(queryDocument);
+
+        if (!result.insertedId) {
+            throw new Error('Failed to insert query');
+        }
+
+        res.status(201).json({
+            message: 'Query submitted successfully',
+            queryId: result.insertedId
+        });
+
+    } catch (error) {
+        console.error('Error submitting query:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+app.get('/queries', async (req, res) => {
+    try {
+        const { email } = req.query;
+
+        const filter = {};
+        if (email) {
+            filter.email = email;
+        }
+
+        const queries = await queriesCollection
+            .find(filter)
+            .sort({ submittedAt: -1 })
+            .toArray();
+
+        res.status(200).json(queries);
+    } catch (error) {
+        console.error('Error fetching queries:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 async function run() {
     try {
