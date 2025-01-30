@@ -8,16 +8,32 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PW}@cluster0.oyqb2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
 // Middleware
-app.use(cors({
-    origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
-    credentials: true
-}));
+const allowedOrigins = [
+    'https://worksync-2ca3b.web.app',
+    'https://worksync-2ca3b.firebaseapp.com',
+    'http://localhost:5173'
+];
+
+const corsOptions = {
+    origin: (origin, callback) => {
+        if (allowedOrigins.includes(origin) || !origin) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
+    credentials: true, // This is crucial
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
-// Add this before your routes
 app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).json({ error: 'Something broke!' });
+    console.error("Error stack:", err.stack); // Log the full error stack
+    res.status(500).json({ error: 'Something broke!', details: err.message });
 });
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -102,7 +118,7 @@ app.get('/queries', async (req, res) => {
 
 async function run() {
     try {
-        await client.connect();
+        await client.connect(); // Ensure this is uncommented
 
         // Test the connection
         const pingResult = await client.db("admin").command({ ping: 1 });
@@ -112,20 +128,7 @@ async function run() {
         app.listen(port, () => {
             console.log(`Server running on PORT: ${port}`);
         });
-
-        // Add this after your MongoDB connection
-        const db = client.db("WorkSync");
-        const collections = {
-            allUsers: db.collection("Users"),
-            admin: db.collection("AdminUsers"),
-            hr: db.collection("HRUsers"),
-            employee: db.collection("EmployeeUsers")
-        };
-
-        // Remove this line since uid is not defined here
-        // const user = await collections.allUsers.findOne({ uid: uid });
-    }
-    catch (error) {
+    } catch (error) {
         console.error("Error connecting to MongoDB:", error);
         process.exit(1);
     }
@@ -133,7 +136,13 @@ async function run() {
 
 // Proper cleanup
 process.on('SIGINT', async () => {
-    await client.close();
+    await client.close(); // Ensure this is uncommented
+    process.exit();
+});
+
+// Proper cleanup
+process.on('SIGINT', async () => {
+    // await client.close();
     process.exit();
 });
 
@@ -143,13 +152,17 @@ app.get('/users/:uid', async (req, res) => {
 
     try {
         const user = await allUsersCollection.findOne({ uid: uid });
+
+        // Add cache control headers
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+
         if (user) {
             res.status(200).json(user);
         } else {
-            res.status(404).json({ error: 'No record found with that UID' });
+            res.status(404).json({ error: 'No record found' });
         }
     } catch (error) {
-        console.error('Error fetching user:', error);
+        console.error('Error:', error);
         res.status(500).json({ error: 'Internal Server Error' });
     }
 });
@@ -157,16 +170,18 @@ app.get('/users/:uid', async (req, res) => {
 // GET method for getting all users excluding admin
 app.get('/users', async (req, res) => {
     try {
-        // Fetch all users except those with userType 'admin'
-        const users = await allUsersCollection.find({ userType: { $ne: "admin" } }).toArray();
-        if (users.length > 0) {
-            res.status(200).json(users);
-        } else {
-            res.status(404).json({ error: 'No users found' });
-        }
+        const users = await allUsersCollection.find({
+            userType: { $ne: "admin" }
+        }).toArray();
+
+        // Always return 200 with array
+        res.status(200).json(users || []);
     } catch (error) {
         console.error('Error fetching users:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+        res.status(500).json({
+            error: 'Internal Server Error',
+            details: error.message
+        });
     }
 });
 
@@ -290,6 +305,11 @@ app.get('/check-user-status/:uid', async (req, res) => {
     try {
         const user = await allUsersCollection.findOne({ uid: userId });
 
+        // Add CORS headers explicitly
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control');
+        res.header('Access-Control-Allow-Origin', 'https://worksync-2ca3b.web.app');
+        res.header('Access-Control-Allow-Credentials', 'true');
+
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -299,8 +319,8 @@ app.get('/check-user-status/:uid', async (req, res) => {
             userType: user.userType
         });
     } catch (error) {
-        console.error('Error checking user status:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        console.error('Error:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
     }
 });
 
@@ -788,3 +808,4 @@ app.put('/approve-payment/:paymentId', async (req, res) => {
 });
 
 run().catch(console.dir);
+module.exports = app;
