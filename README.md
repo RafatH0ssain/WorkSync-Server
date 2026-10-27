@@ -1,148 +1,95 @@
-# WorkSync Backend
+# WorkSync Server
 
+Backend for WorkSync, an employee management and payroll app. Express and MongoDB, with Firebase Admin for user lookups. The frontend is a separate repo: [WorkSync-Client](https://github.com/RafatH0ssain/WorkSync-Client).
 
-## Overview
-WorkSync's backend is built using **Node.js**, **Express.js**, and **MongoDB**, providing a robust and scalable server for managing employee data, payroll, and user authentication. The API supports role-based access with **JWT authentication** and integrates **Firebase** for secure user management.
+## What it does
 
+REST API for an HR workflow at a small company:
 
-## Frontend:
-[Github Link](https://github.com/RafatH0ssain/WorkSync-Client)
+- User records with admin, HR, and employee roles
+- Monthly work worksheets per employee
+- Salary adjustments with history
+- Payment requests, approval, and payment history
+- A support query inbox
 
+One Express file (`index.js`) holds the routes, the MongoDB connection, and CORS config. Data lives in MongoDB collections for users, worksheets, payments, salary history, and queries.
 
-## 📚 API Documentation
+## Run it
 
-### 👥 User Management
+Prerequisites: Node.js 18 to 24, a MongoDB database, and a Firebase service-account JSON file kept somewhere outside this repo. (Node 26 breaks at load time on a transitive dependency of firebase-admin.)
 
-#### 🔍 Get User by UID
-**Endpoint:** `GET /users/:uid`  
-**Description:** Retrieve details of a specific user by their Firebase UID  
-**Response:**  
+```bash
+npm install
+cp .env.example .env   # fill in the values
+npm start
+```
+
+`.env` variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `PORT` | Port to listen on. Defaults to 5000. |
+| `DB_USER`, `DB_PW` | MongoDB credentials |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Absolute path to the service-account JSON, outside the repo |
+
+On a host that provides default Google credentials (for example Google Cloud), you can leave `GOOGLE_APPLICATION_CREDENTIALS` unset.
+
+## API
+
+All routes accept and return JSON. There is no authentication header; see the note below.
+
+**Users**
+
+- `GET /users/:uid`: one user by Firebase UID
+- `GET /users`: all non-admin users
+- `POST /users`: register a user
+- `GET /check-user-status/:uid`: whether a user is active or fired
+- `POST /fire/:uid`: mark a user fired
+- `POST /make-hr/:id`: promote an employee to HR
+- `POST /toggle-verification/:id`: toggle a user's verified flag
+
+**Worksheets**
+
+- `POST /worksheet`: add a worksheet entry
+- `GET /worksheet/:email`: entries for one employee
+- `GET /worksheet`: all entries
+- `PUT /worksheet/:id`: edit an entry
+- `DELETE /worksheet/:id`: remove an entry
+
+**Salary and payments**
+
+- `POST /adjust-salary/:id`: set a new salary for a user
+- `GET /salary-history/:id`: salary adjustment history
+- `POST /process-payment`: create a payment request
+- `PUT /approve-payment/:paymentId`: approve or reject a payment request
+- `GET /check-pending-payment/:email`: pending payment for an employee
+- `GET /employee-owed/:email`: unpaid worksheet total for an employee
+- `GET /payment-history/:email`: payment history for an employee
+- `GET /payment-history`: payment history across employees
+- `GET /payment-historya/:email`: legacy alias of the route above, kept for the deployed client
+
+**Queries**
+
+- `POST /submit-query`: submit a support query
+- `GET /queries`: list queries, optionally filtered by `?email=`
+
+Example, creating a worksheet entry:
+
 ```json
+POST /worksheet
 {
-  "_id": "string",
-  "name": "string",
-  "email": "string",
-  "userType": "admin|hr|employee",
-  "status": "active|fired",
-  "createdAt": "ISO date"
+  "email": "employee@example.com",
+  "hoursWorked": 8,
+  "date": "2025-01-19"
 }
 ```
 
-#### 📋 Get All Users
-**Endpoint:** `GET /users`  
-**Description:** Get all non-admin users  
-**Response:** Array of user objects  
+## Out of scope
 
-#### 📝 Register User
-**Endpoint:** `POST /users`  
-**Body:**  
-```json
-{
-  "name": "string",
-  "email": "string",
-  "photoURL": "string",
-  "uid": "string",
-  "userType": "admin|hr|employee"
-}
-```
+No route checks authentication or authorization. Anyone who can reach the server can call every endpoint, including `POST /fire/:uid` and `PUT /approve-payment/:paymentId`. Role checks and token verification are a known gap. Do not expose this server publicly as-is.
 
-#### ⬆️ Promote to HR
-**Endpoint:** `POST /make-hr/:id`  
-**Description:** Promote an employee to HR role  
-**Params:** MongoDB document ID  
+There are no tests and no CI.
 
-### ❓ Queries
+## License
 
-#### ✉️ Submit Query
-**Endpoint:** `POST /submit-query`  
-**Body:**  
-```json
-{
-  "heading": "string",
-  "designation": "string",
-  "details": "string",
-  "email": "string"
-}
-```
-
-#### 📨 Get Queries 
-**Endpoint:** `GET /queries`  
-**Query Params:** ?email=user@example.com  
-**Response:** Array of query objects  
-
-### 📅 Worksheet Management
-#### ➕ Create Worksheet Entry
-**Endpoint:** `POST /worksheet`  
-**Body:**  
-```json
-{
-  "email": "string",
-  "hoursWorked": "number",
-  "date": "ISO date"
-}
-```
-
-#### 📂 Get Worksheet Entries
-**Endpoint:** `GET /worksheet/:email`  
-**Response:** Array of worksheet entries for specified user  
-
-### 💰 Payments
-#### 💸 Process Payment
-**Endpoint:** `POST /process-payment`  
-**Body:**  
-```json
-{
-  "email": "string",
-  "amount": "number",
-  "paidBy": "string",
-  "entries": ["array of entry IDs"]
-}
-```
-
-#### 📊 Get Payment History
-**Endpoint:** `GET /payment-history/:email`  
-**Response:**  
-```json
-{
-  "payments": [
-    {
-      "month": "string",
-      "salary": "number",
-      "approvedBy": "string"
-    }
-  ]
-}
-```
-
-#### ⏳ Check Pending Payments
-**Endpoint:** `GET /check-pending-payment/:email`  
-**Response:**  
-```json
-{
-  "hasPendingPayment": "boolean",
-  "pendingPayment": "object|null"
-}
-```
-
-### 💼 Salary Management
-#### 📈 Adjust Salary
-**Endpoint:** `POST /adjust-salary/:id`  
-**Params:** MongoDB document ID  
-**Body:**  
-```json
-{ "salary": "number" }
-```
-
-### 📜 Get Salary History
-**Endpoint:** `GET /salary-history/:id`  
-**Response:** Array of salary adjustment objects  
-
-
-## 📬 Contact
-For any questions or support, please contact:
-
-📧 [Email](mailto:rafat.click.hossain@gmail.com)
-
-👔 [LinkedIn](https://www.linkedin.com/in/muhammad-rafat-hossain/)
-
-**Let's connect! 🤝**
+MIT. See [LICENSE](LICENSE).

@@ -6,16 +6,15 @@
     "firebase-admin": "^13.0.2",
     "mongodb": "5.5"
   },
-  "name": "worksync---server",
+  "name": "worksync-server",
   "version": "1.0.0",
-  "description": "\"# b10a12-server-side-RafatH0ssain\"",
+  "description": "Express and MongoDB backend for WorkSync, an employee management and payroll system",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "MIT"
 }

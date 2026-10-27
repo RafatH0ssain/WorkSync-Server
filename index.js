@@ -46,11 +46,12 @@ const client = new MongoClient(uri, {
 });
 
 const admin = require('firebase-admin');
-const serviceAccount = require('./worksync-2ca3b-firebase-adminsdk-sxxrh-0adbd0d0d3.json'); // Ensure this is the correct path to your service account key
 
-// Initialize Firebase Admin SDK with service account
+// Credentials come from the environment, never from a file in this repo.
+// Set GOOGLE_APPLICATION_CREDENTIALS to the path of a service-account JSON
+// kept outside the repository (see .env.example / README).
 admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
+    credential: admin.credential.applicationDefault(),
 });
 
 const db = client.db("WorkSync");
