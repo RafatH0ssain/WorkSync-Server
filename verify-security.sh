@@ -144,8 +144,8 @@ check "(b) GET /users is disabled without ADMIN_TOKEN" \
     "503" "$(status_of GET /users)"
 check "(d) POST /process-payment is blocked without ADMIN_TOKEN" \
     "503" "$(status_of POST /process-payment '' '{"email":"a@b.c","amount":1,"paidBy":"x","entries":[{"_id":"507f1f77bcf86cd799439011"}]}')"
-check "(c) POST /users is disabled without ADMIN_TOKEN" \
-    "503" "$(status_of POST /users '' '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
+check "(c) POST /users is open (signup) but still rejects admin without a token" \
+    "400" "$(status_of POST /users '' '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
 
 stop_server
 
@@ -162,8 +162,12 @@ check "(c) POST /users with userType admin is rejected" \
     "400" "$(status_of POST /users sekret-test-token '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
 check "(c) POST /users with userType hr is rejected" \
     "400" "$(status_of POST /users sekret-test-token '{"name":"n","email":"a@b.c","uid":"u1","userType":"hr"}')"
-check "(c) POST /users without token is rejected" \
-    "401" "$(status_of POST /users '' '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
+check "(c) POST /users is open (signup) but still rejects admin with a wrong token" \
+    "400" "$(status_of POST /users wrong-token '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
+check "(c) POST /users signup with valid employee payload passes input gate (503 db)" \
+    "503" "$(status_of POST /users '' '{"name":"n","email":"a@b.c","uid":"u1"}')"
+check "(c) POST /submit-query contact form is open (503 db, not 401)" \
+    "503" "$(status_of POST /submit-query '' '{"heading":"h","designation":"d","details":"x","email":"a@b.c"}')"
 check "(c) NoSQL operator object in email is rejected" \
     "400" "$(status_of POST /users sekret-test-token '{"name":"n","email":{"$gt":""},"uid":"u1"}')"
 check "(d) POST /process-payment without token is rejected" \

@@ -388,7 +388,7 @@ if (process.env.VERIFY_ASYNC_ROUTE === '1') {
     }));
 }
 
-app.post('/submit-query', requireAdmin, validateQuerySubmission, requireDb, asyncHandler(async (req, res) => {
+app.post('/submit-query', validateQuerySubmission, requireDb, asyncHandler(async (req, res) => {
     const { heading, designation, details, submittedAt, email } = req.body;
 
     const queryDocument = {
@@ -469,7 +469,7 @@ app.get('/users', requireAdmin, validateListQuery, requireDb, asyncHandler(async
     res.status(200).json(users || []);
 }));
 
-app.post('/users', requireAdmin, validateUserRegistration, requireDb, asyncHandler(async (req, res) => {
+app.post('/users', validateUserRegistration, requireDb, asyncHandler(async (req, res) => {
     // Only these fields are stored. Any role-ish field in the body is dropped;
     // userType is decided here, never taken from the caller.
     const { name, email, photoURL, uid } = req.body;

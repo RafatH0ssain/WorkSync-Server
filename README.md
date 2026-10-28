@@ -46,7 +46,7 @@ There is no per-user identity system yet. Privileged routes run behind a shared 
 - Callers of protected routes send the matching `x-admin-token` request header.
 - With `ADMIN_TOKEN` empty or absent, every protected route returns 503 with a message that admin operations are disabled. This is the default, so a fresh deployment starts out safe.
 
-Protected routes are every POST, PUT, and DELETE route, plus the bulk reads `GET /users`, `GET /worksheet`, `GET /payment-history`, `GET /queries`, and `GET /salary-history/:id`. A missing or wrong token returns 401. The deployed client does not send the header yet, so its registration form, contact form, and admin pages need the header added before they work again.
+Protected routes are every POST, PUT, and DELETE route except the two public writes below, plus the bulk reads `GET /users`, `GET /worksheet`, `GET /payment-history`, `GET /queries`, and `GET /salary-history/:id`. A missing or wrong token returns 401.
 
 What the boundary enforces on specific routes:
 
@@ -55,7 +55,7 @@ What the boundary enforces on specific routes:
 - `POST /worksheet` and `PUT /worksheet/:id` accept only the fields the app uses (`task`, `hoursWorked`, `date`, `userId`, `email`).
 - `POST /adjust-salary/:id` returns 501 Not Implemented. It stays unimplemented on purpose until it can be reviewed.
 
-Open routes are the single-record reads the client needs for its own pages (`GET /users/:uid`, `GET /worksheet/:email`, and the other per-employee lookups) plus `GET /`. Anyone who knows an employee's email or uid can still read that one employee's data through them. Closing that needs real per-user auth.
+Open routes are the two public writes `POST /users` (signup) and `POST /submit-query` (contact form), the single-record reads the client needs for its own pages (`GET /users/:uid`, `GET /worksheet/:email`, and the other per-employee lookups), plus `GET /`. Anyone who knows an employee's email or uid can still read that one employee's data through them. Closing that needs real per-user auth.
 
 Error responses carry a generic message and a `requestId`. The real error goes to the server log, keyed by the same id. Every response also carries `X-Request-Id`, and each request is logged on completion with its method, path, status and duration.
 
@@ -88,7 +88,7 @@ All routes accept and return JSON. Protected routes need the `x-admin-token` hea
 
 - `GET /users/:uid`: one user by Firebase UID (open)
 - `GET /users`: all non-admin users (protected, `?limit=` capped at 200)
-- `POST /users`: register an employee (protected, employees only)
+- `POST /users`: register an employee (open; always writes `userType: "employee"`)
 - `GET /check-user-status/:uid`: whether a user is active or fired (open)
 - `POST /fire/:uid`: mark a user fired (protected)
 - `POST /make-hr/:id`: promote an employee to HR (protected)
@@ -116,7 +116,7 @@ All routes accept and return JSON. Protected routes need the `x-admin-token` hea
 
 **Queries**
 
-- `POST /submit-query`: submit a support query (protected)
+- `POST /submit-query`: submit a support query (open)
 - `GET /queries`: list queries, optionally filtered by `?email=` (protected, `?limit=` capped at 200)
 
 Example, creating a worksheet entry:
@@ -152,7 +152,7 @@ It needs `node` and `curl`.
 
 No per-user authentication or authorization. The `x-admin-token` header is one shared secret for the whole admin surface, not a user identity, and the open single-record reads still expose one employee's data to anyone who knows their email or uid. Server-side role checks that verify real user tokens are a known gap.
 
-Open product decision for the owner: `POST /users` and `POST /submit-query` sit behind `requireAdmin`, which keeps strangers from writing to the database but also disables the deployed client's signup and contact forms until those callers can send the header (or the routes grow real user auth).
+Signup (`POST /users`) and the contact form (`POST /submit-query`) are open by design so the deployed demo works for visitors. Both are still validated; registration can only create `employee` records. Everything else that writes is behind `x-admin-token`.
 
 ## License
 
