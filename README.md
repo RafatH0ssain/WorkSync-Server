@@ -30,10 +30,13 @@ npm start
 | --- | --- |
 | `PORT` | Port to listen on. Defaults to 5000. |
 | `DB_USER`, `DB_PW` | MongoDB credentials |
+| `MONGO_URI` | Full MongoDB connection string. When set it wins over the pieces below. |
+| `MONGO_CLUSTER` | Atlas hostname. Defaults to `cluster0.oyqb2.mongodb.net`. |
 | `ADMIN_TOKEN` | Shared secret for admin routes. Empty or absent disables them (503). |
+| `RATE_LIMIT_MAX` | Requests per client address per minute. Defaults to 120. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Reserved for future Firebase token verification. Unused today. |
 
-`GET /` reports whether the process is up and whether MongoDB is reachable. The server keeps running when MongoDB is down and answers 503 on data routes until the connection succeeds.
+`GET /` reports whether the process is up and whether MongoDB is reachable. It only reads a cached flag, so it stays cheap and never touches the database. The server keeps running when MongoDB is down and answers 503 on data routes until the connection succeeds.
 
 ## Security boundary
 
@@ -54,7 +57,28 @@ What the boundary enforces on specific routes:
 
 Open routes are the single-record reads the client needs for its own pages (`GET /users/:uid`, `GET /worksheet/:email`, and the other per-employee lookups) plus `GET /`. Anyone who knows an employee's email or uid can still read that one employee's data through them. Closing that needs real per-user auth.
 
-Error responses carry a generic message and a `requestId`. The real error goes to the server log, keyed by the same id.
+Error responses carry a generic message and a `requestId`. The real error goes to the server log, keyed by the same id. Every response also carries `X-Request-Id`, and each request is logged on completion with its method, path, status and duration.
+
+### Roles
+
+The server never reads a role out of the request. There is no role header and no role claim in any body that changes what a caller may do. Privileged routes are gated by the `x-admin-token` secret alone. When a role is written to the database (`userType` on registration, on promotion to HR) the value is decided server side: `POST /users` stores `userType: "employee"` always, `POST /make-hr/:id` is the only way to write `userType: "hr"`, and no route can write `userType: "admin"`. Role checks on the client are UI convenience only.
+
+### Input validation
+
+Every `req.params`, `req.query` and `req.body` value that reaches a database query is type checked and length capped before the database gate runs, so bad input answers 400 even while MongoDB is down:
+
+- Ids used as `ObjectId` must be 24 hex characters. `new ObjectId(undefined)` would otherwise mint a fresh id, and operator objects must never reach a cast.
+- Strings are checked with `typeof === "string"` and a per field length cap, so query operators like `{"$gt": ""}` in `email` are rejected rather than executed.
+- List endpoints accept `?limit=`, a positive integer capped at 200. Collection reads default to 200 rows and never stream a whole collection to the client.
+- JSON bodies are capped at 100 KB.
+
+### Rate limits
+
+Each client address gets `RATE_LIMIT_MAX` requests per minute (default 120) across the API. Over budget answers 429 with a `Retry-After` header. `GET /` is exempt so health probes keep working. The limiter is in memory and per process; running several instances needs a shared store for a single global budget.
+
+### Response headers
+
+Every response sets `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and `Cache-Control: no-store`.
 
 ## API
 
@@ -63,7 +87,7 @@ All routes accept and return JSON. Protected routes need the `x-admin-token` hea
 **Users**
 
 - `GET /users/:uid`: one user by Firebase UID (open)
-- `GET /users`: all non-admin users (protected)
+- `GET /users`: all non-admin users (protected, `?limit=` capped at 200)
 - `POST /users`: register an employee (protected, employees only)
 - `GET /check-user-status/:uid`: whether a user is active or fired (open)
 - `POST /fire/:uid`: mark a user fired (protected)
@@ -74,7 +98,7 @@ All routes accept and return JSON. Protected routes need the `x-admin-token` hea
 
 - `POST /worksheet`: add a worksheet entry (protected)
 - `GET /worksheet/:email`: entries for one employee (open)
-- `GET /worksheet`: all entries (protected)
+- `GET /worksheet`: all entries (protected, `?limit=` capped at 200)
 - `PUT /worksheet/:id`: edit an entry (protected)
 - `DELETE /worksheet/:id`: remove an entry (protected)
 
@@ -87,13 +111,13 @@ All routes accept and return JSON. Protected routes need the `x-admin-token` hea
 - `GET /check-pending-payment/:email`: pending payment for an employee (open)
 - `GET /employee-owed/:email`: unpaid worksheet total for an employee (open)
 - `GET /payment-history/:email`: payment history for an employee (open)
-- `GET /payment-history`: payment history across employees (protected)
+- `GET /payment-history`: payment history across employees (protected, `?limit=` capped at 200)
 - `GET /payment-historya/:email`: legacy alias kept for the deployed client (open)
 
 **Queries**
 
 - `POST /submit-query`: submit a support query (protected)
-- `GET /queries`: list queries, optionally filtered by `?email=` (protected)
+- `GET /queries`: list queries, optionally filtered by `?email=` (protected, `?limit=` capped at 200)
 
 Example, creating a worksheet entry:
 
@@ -110,11 +134,25 @@ POST /worksheet
 
 ## Tests
 
-`npm test` runs `verify-security.sh`. It boots the server with dummy env vars and checks that the server comes up without Google credentials, that protected routes refuse requests without the token, that `userType: "admin"` on registration is rejected, and that the `POST /process-payment` guard holds. It needs `node` and `curl` and touches no real data.
+`npm test` runs `verify-security.sh`. It boots the server with dummy env vars (no MongoDB, no Google credentials) and checks, without touching real data:
+
+- the server boots and answers with JSON while the database is down
+- protected routes refuse requests without a valid `x-admin-token`
+- `userType: "admin"` on registration is rejected
+- the `POST /process-payment` ownership guard holds
+- operator-object and junk ObjectId injections are rejected with 400
+- list endpoints cap scans and reject a bad `?limit=`
+- security headers and the `x-admin-token` preflight allowance are present
+- the rate limiter returns 429 over budget while health checks stay exempt
+- an async handler rejection answers 500 and leaves the process alive
+
+It needs `node` and `curl`.
 
 ## Out of scope
 
 No per-user authentication or authorization. The `x-admin-token` header is one shared secret for the whole admin surface, not a user identity, and the open single-record reads still expose one employee's data to anyone who knows their email or uid. Server-side role checks that verify real user tokens are a known gap.
+
+Open product decision for the owner: `POST /users` and `POST /submit-query` sit behind `requireAdmin`, which keeps strangers from writing to the database but also disables the deployed client's signup and contact forms until those callers can send the header (or the routes grow real user auth).
 
 ## License
 
