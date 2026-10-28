@@ -74,6 +74,14 @@ function isOptStr(value, max) {
     return value === undefined || (typeof value === 'string' && value.length <= max);
 }
 
+// Own-record check for the single-record reads. uid compares exactly, email
+// compares case-insensitively.
+function isSelfMatch(requested, claim, field) {
+    if (typeof requested !== 'string' || typeof claim !== 'string') return false;
+    if (field === 'email') return requested.toLowerCase() === claim.toLowerCase();
+    return requested === claim;
+}
+
 // In-memory fixed-window rate limiter keyed by client address. One bucket per
 // address per minute; enough for a single-process portfolio API. Multi-instance
 // deployments need a shared store (see README).
@@ -182,6 +190,7 @@ const employeeCollection = db.collection("EmployeeUsers");
 const paymentRequestsCollection = db.collection("PaymentRequests");
 const worksheetCollection = db.collection("EmployeeWorksheets");
 const queriesCollection = db.collection("Queries");
+const salaryHistoryCollection = db.collection("SalaryHistory");
 
 // Whether the MongoDB connection is up. Routes that touch the database check
 // this first and answer 503 instead of hanging on a dead connection.
@@ -215,6 +224,134 @@ function requireAdmin(req, res, next) {
         return res.status(401).json({ error: 'Missing or invalid x-admin-token header' });
     }
     next();
+}
+
+// ---------------------------------------------------------------------------
+// Firebase ID-token auth. Credentials resolve in this order:
+//   1. GOOGLE_APPLICATION_CREDENTIALS, a key file outside the repo (local dev)
+//   2. Application Default Credentials (Google Cloud)
+//   3. FIREBASE_SERVICE_ACCOUNT, the key JSON as a string (Vercel and similar)
+// When none of them is usable the app still boots: a log line marks ID-token
+// auth as disabled and every ID-token route answers 401. The x-admin-token
+// path is unaffected either way.
+// ---------------------------------------------------------------------------
+let firebaseAuth = null;
+
+// ADC is lazy: it constructs without any platform credential and only fails
+// when used. This host check keeps the Google Cloud path from swallowing the
+// FIREBASE_SERVICE_ACCOUNT fallback on hosts with no ADC at all.
+function isGoogleCloudHost() {
+    return Boolean(process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT
+        || process.env.K_SERVICE || process.env.GAE_SERVICE
+        || process.env.FUNCTION_NAME || process.env.FUNCTION_TARGET);
+}
+
+(function initFirebaseAuth() {
+    let sdk;
+    try {
+        sdk = {
+            ...require('firebase-admin/app'),
+            getAuth: require('firebase-admin/auth').getAuth
+        };
+    } catch (err) {
+        console.error('Firebase ID-token auth disabled: firebase-admin failed to load:', err.message);
+        return;
+    }
+
+    let credential = null;
+    let source = '';
+    const attempts = [];
+
+    // 1. GOOGLE_APPLICATION_CREDENTIALS: key file outside the repo.
+    const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+    if (keyPath) {
+        try {
+            credential = sdk.cert(keyPath);
+            source = 'GOOGLE_APPLICATION_CREDENTIALS';
+        } catch (err) {
+            attempts.push(`GOOGLE_APPLICATION_CREDENTIALS: ${err.message}`);
+        }
+    }
+    // 2. Application Default Credentials.
+    if (!credential && isGoogleCloudHost()) {
+        try {
+            credential = sdk.applicationDefault();
+            source = 'application default credentials';
+        } catch (err) {
+            attempts.push(`application default credentials: ${err.message}`);
+        }
+    }
+    // 3. FIREBASE_SERVICE_ACCOUNT: the key JSON as a string.
+    if (!credential && process.env.FIREBASE_SERVICE_ACCOUNT) {
+        try {
+            credential = sdk.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT));
+            source = 'FIREBASE_SERVICE_ACCOUNT';
+        } catch (err) {
+            attempts.push(`FIREBASE_SERVICE_ACCOUNT: ${err.message}`);
+        }
+    }
+
+    if (!credential) {
+        console.error('Firebase ID-token auth disabled: no usable credentials'
+            + (attempts.length ? ` (${attempts.join('; ')})` : '')
+            + '. ID-token routes answer 401; x-admin-token still works.');
+        return;
+    }
+    try {
+        if (sdk.getApps().length === 0) {
+            sdk.initializeApp({ credential });
+        }
+        firebaseAuth = sdk.getAuth();
+        console.log(`Firebase ID-token auth enabled via ${source}`);
+    } catch (err) {
+        firebaseAuth = null;
+        console.error('Firebase ID-token auth disabled: initialization failed:', err.message);
+    }
+})();
+
+// Per-user gate: Authorization: Bearer <firebase-id-token>. Every failure
+// answers 401 with the same body; the SDK error stays in the server log.
+const requireUser = asyncHandler(async (req, res, next) => {
+    if (!firebaseAuth) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+    const match = /^Bearer\s+(\S+)$/.exec(req.get('authorization') || '');
+    if (!match) {
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+    try {
+        const decoded = await firebaseAuth.verifyIdToken(match[1]);
+        req.user = { uid: decoded.uid, email: decoded.email };
+        next();
+    } catch (err) {
+        console.error(`[${req.id}] ID token rejected:`, err.message);
+        return res.status(401).json({ error: 'Authentication required' });
+    }
+});
+
+// Either credential opens these routes: a verified ID token or x-admin-token.
+// The admin path is tried first so a request carrying both keeps the admin
+// rights the shared secret grants.
+function requireUserOrAdmin(req, res, next) {
+    const expected = process.env.ADMIN_TOKEN;
+    const provided = req.get('x-admin-token');
+    if (expected && provided && safeEqual(provided, expected)) {
+        req.adminCall = true;
+        return next();
+    }
+    return requireUser(req, res, next);
+}
+
+// Own-record gate for the single-record reads. A caller who got in with an ID
+// token reads only their own record; admin-token callers read any record.
+function requireSelf(field) {
+    return (req, res, next) => {
+        if (req.adminCall) return next();
+        if (!isSelfMatch(req.params[field], req.user && req.user[field], field)) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        next();
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +493,17 @@ function validateApprovePaymentBody(req, res, next) {
     next();
 }
 
+// Salary writes carry an absolute value, so the record ends up with exactly
+// the number the admin sends. Bounded to 0..99999; a JSON number that arrives
+// as Infinity or NaN fails Number.isFinite and is rejected here.
+function validateSalaryBody(req, res, next) {
+    const { newSalary } = req.body || {};
+    if (typeof newSalary !== 'number' || !Number.isFinite(newSalary) || newSalary < 0 || newSalary >= 100000) {
+        return res.status(400).json({ error: 'newSalary must be a finite number from 0 up to 100000' });
+    }
+    next();
+}
+
 function validateQueriesQuery(req, res, next) {
     const { email } = req.query;
     if (email !== undefined && !isStr(email, MAXLEN.email)) {
@@ -447,7 +595,7 @@ async function connectWithRetry() {
 }
 
 // GET method for getting the current logged in user
-app.get('/users/:uid', requireStringParam('uid', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
+app.get('/users/:uid', requireUserOrAdmin, requireStringParam('uid', MAXLEN.uid), requireSelf('uid'), requireDb, asyncHandler(async (req, res) => {
     const user = await allUsersCollection.findOne({ uid: req.params.uid });
 
     if (user) {
@@ -545,7 +693,7 @@ app.post('/fire/:uid', requireAdmin, requireStringParam('uid', MAXLEN.uid), requ
 }));
 
 // Add a new endpoint to check user status during login
-app.get('/check-user-status/:uid', requireStringParam('uid', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
+app.get('/check-user-status/:uid', requireUserOrAdmin, requireStringParam('uid', MAXLEN.uid), requireSelf('uid'), requireDb, asyncHandler(async (req, res) => {
     const user = await allUsersCollection.findOne({ uid: req.params.uid });
 
     if (!user) {
@@ -612,12 +760,41 @@ app.post('/make-hr/:id', requireAdmin, requireObjectIdParam('id'), requireDb, as
     });
 }));
 
-// Salary adjustment is not implemented. The old handler called a function that
-// does not exist and always crashed, so answer 501 until there is a real,
-// reviewed implementation behind this route.
-app.post('/adjust-salary/:id', requireAdmin, (req, res) => {
-    res.status(501).json({ error: 'Salary adjustment is not implemented' });
-});
+// Set an employee's salary and record the change. The history row keeps the
+// previous value, the new value, the time, and the credential that made the
+// change. The shared secret is never echoed back.
+app.post('/adjust-salary/:id', requireAdmin, requireObjectIdParam('id'), validateSalaryBody, requireDb, asyncHandler(async (req, res) => {
+    const userId = new ObjectId(req.params.id);
+    const { newSalary } = req.body;
+
+    const user = await allUsersCollection.findOne({ _id: userId });
+    if (!user) {
+        return res.status(404).json({ error: 'Employee not found' });
+    }
+    const previousSalary = typeof user.salary === 'number' ? user.salary : null;
+
+    const session = client.startSession();
+    try {
+        await session.withTransaction(async () => {
+            await allUsersCollection.updateOne(
+                { _id: userId },
+                { $set: { salary: newSalary } },
+                { session }
+            );
+            await salaryHistoryCollection.insertOne({
+                userId,
+                previousSalary,
+                newSalary,
+                changedBy: 'x-admin-token',
+                changedAt: new Date()
+            }, { session });
+        });
+    } finally {
+        await session.endSession();
+    }
+
+    res.status(200).json({ message: 'Salary updated successfully', previousSalary, newSalary });
+}));
 
 // Toggle employee verification status
 app.post('/toggle-verification/:id', requireAdmin, requireObjectIdParam('id'), validateVerificationBody, requireDb, asyncHandler(async (req, res) => {
@@ -681,7 +858,7 @@ app.post('/worksheet', requireAdmin, validateWorksheetBody, requireDb, asyncHand
 }));
 
 // Endpoint to get worksheet entries for a specific employee
-app.get('/worksheet/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+app.get('/worksheet/:email', requireUserOrAdmin, requireStringParam('email', MAXLEN.email), requireSelf('email'), requireDb, asyncHandler(async (req, res) => {
     const entries = await worksheetCollection
         .find({ email: req.params.email })
         .sort({ date: -1 })
@@ -765,7 +942,7 @@ app.get('/payment-history', requireAdmin, validateListQuery, requireDb, asyncHan
 }));
 
 // Returns total of emplyee with email: email
-app.get('/payment-history/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+app.get('/payment-history/:email', requireUserOrAdmin, requireStringParam('email', MAXLEN.email), requireSelf('email'), requireDb, asyncHandler(async (req, res) => {
     const { email } = req.params;
 
     // Fetch payment history filtered by email
@@ -811,7 +988,7 @@ app.get('/payment-history/:email', requireStringParam('email', MAXLEN.email), re
 }));
 
 // Returns array of payments for this employee
-app.get('/payment-historya/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+app.get('/payment-historya/:email', requireUserOrAdmin, requireStringParam('email', MAXLEN.email), requireSelf('email'), requireDb, asyncHandler(async (req, res) => {
     const { email } = req.params;
 
     const paymentHistory = await paymentRequestsCollection
@@ -827,7 +1004,7 @@ app.get('/payment-historya/:email', requireStringParam('email', MAXLEN.email), r
 }));
 
 // New endpoint to get total amount owed to employee (worksheetcollection)
-app.get('/employee-owed/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+app.get('/employee-owed/:email', requireUserOrAdmin, requireStringParam('email', MAXLEN.email), requireSelf('email'), requireDb, asyncHandler(async (req, res) => {
     const { email } = req.params;
 
     // Get all worksheet entries
@@ -926,7 +1103,7 @@ app.post('/process-payment', requireAdmin, validatePaymentBody, requireDb, async
     res.status(200).json({ message: 'Payment processed successfully' });
 }));
 
-app.get('/check-pending-payment/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+app.get('/check-pending-payment/:email', requireUserOrAdmin, requireStringParam('email', MAXLEN.email), requireSelf('email'), requireDb, asyncHandler(async (req, res) => {
     // Find any pending payments for this employee
     const pendingPayment = await paymentRequestsCollection.findOne({
         email: req.params.email,
@@ -1026,3 +1203,4 @@ module.exports.parseLimit = parseLimit;
 module.exports.isValidObjectId = isValidObjectId;
 module.exports.asyncHandler = asyncHandler;
 module.exports.isStr = isStr;
+module.exports.isSelfMatch = isSelfMatch;
