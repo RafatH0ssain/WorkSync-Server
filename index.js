@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const app = express();
@@ -32,8 +33,9 @@ app.options('*', cors(corsOptions));
 app.use(express.json());
 
 app.use((err, req, res, next) => {
-    console.error("Error stack:", err.stack); // Log the full error stack
-    res.status(500).json({ error: 'Something broke!', details: err.message });
+    const requestId = crypto.randomUUID();
+    console.error(`[${requestId}] Error stack:`, err.stack); // Log the full error stack
+    res.status(500).json({ error: 'Internal server error', requestId });
 });
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -45,15 +47,6 @@ const client = new MongoClient(uri, {
     }
 });
 
-const admin = require('firebase-admin');
-
-// Credentials come from the environment, never from a file in this repo.
-// Set GOOGLE_APPLICATION_CREDENTIALS to the path of a service-account JSON
-// kept outside the repository (see .env.example / README).
-admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-});
-
 const db = client.db("WorkSync");
 const allUsersCollection = db.collection("Users");
 const adminCollection = db.collection("AdminUsers");
@@ -63,9 +56,67 @@ const paymentRequestsCollection = db.collection("PaymentRequests");
 const worksheetCollection = db.collection("EmployeeWorksheets");
 const queriesCollection = db.collection("Queries");
 
-app.post('/submit-query', async (req, res) => {
+// Whether the MongoDB connection is up. Routes that touch the database check
+// this first and answer 503 instead of hanging on a dead connection.
+const dbState = { connected: false };
+
+function requireDb(req, res, next) {
+    if (!dbState.connected) {
+        return res.status(503).json({ error: 'Database unavailable. Try again shortly.' });
+    }
+    next();
+}
+
+function safeEqual(a, b) {
+    const ab = Buffer.from(String(a));
+    const bb = Buffer.from(String(b));
+    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+// Shared-secret gate for privileged operations. Callers must send the
+// x-admin-token header matching the ADMIN_TOKEN env var. When ADMIN_TOKEN is
+// empty or absent every route behind this middleware is disabled with 503.
+function requireAdmin(req, res, next) {
+    const expected = process.env.ADMIN_TOKEN;
+    if (!expected) {
+        return res.status(503).json({ error: 'Admin API disabled: ADMIN_TOKEN is not set' });
+    }
+    const provided = req.get('x-admin-token');
+    if (!provided || !safeEqual(provided, expected)) {
+        return res.status(401).json({ error: 'Missing or invalid x-admin-token header' });
+    }
+    next();
+}
+
+// Boundary check for user creation. Self-registration only ever creates
+// employees: promotion to hr happens via /make-hr, and nothing here can create
+// an admin record. Runs before requireDb so bad input fails fast.
+function validateUserRegistration(req, res, next) {
+    const { name, email, photoURL, uid, userType } = req.body || {};
+    if (typeof name !== 'string' || typeof email !== 'string' || typeof uid !== 'string') {
+        return res.status(400).json({ message: 'name, email and uid must be strings' });
+    }
+    if (photoURL !== undefined && typeof photoURL !== 'string') {
+        return res.status(400).json({ message: 'photoURL must be a string' });
+    }
+    const requestedType = userType === undefined ? 'employee' : userType;
+    if (requestedType !== 'employee') {
+        return res.status(400).json({ message: "userType must be 'employee'" });
+    }
+    next();
+}
+
+// Health check. Answers even when MongoDB is unreachable.
+app.get('/', (req, res) => {
+    if (dbState.connected) {
+        return res.status(200).json({ status: 'ok', database: 'connected' });
+    }
+    res.status(503).json({ status: 'degraded', database: 'disconnected' });
+});
+
+app.post('/submit-query', requireAdmin, requireDb, async (req, res) => {
     try {
-        const { heading, designation, details, submittedAt, email } = req.body;
+        const { heading, designation, details, submittedAt, email } = req.body || {};
 
         // Create query document
         const queryDocument = {
@@ -96,9 +147,13 @@ app.post('/submit-query', async (req, res) => {
     }
 });
 
-app.get('/queries', async (req, res) => {
+app.get('/queries', requireAdmin, requireDb, async (req, res) => {
     try {
         const { email } = req.query;
+
+        if (email !== undefined && typeof email !== 'string') {
+            return res.status(400).json({ error: 'email must be a string' });
+        }
 
         const filter = {};
         if (email) {
@@ -117,21 +172,20 @@ app.get('/queries', async (req, res) => {
     }
 });
 
-async function run() {
+// Connect to MongoDB with retry and backoff. A failed connect must never kill
+// the process: routes gated on requireDb answer 503 until the connection is up.
+async function connectWithRetry() {
     try {
-        await client.connect(); // Ensure this is uncommented
+        await client.connect();
 
         // Test the connection
         const pingResult = await client.db("admin").command({ ping: 1 });
+        dbState.connected = true;
         console.log("MongoDB connection successful!", pingResult);
-
-        // Start the server only after successful connection
-        app.listen(port, () => {
-            console.log(`Server running on PORT: ${port}`);
-        });
     } catch (error) {
-        console.error("Error connecting to MongoDB:", error);
-        process.exit(1);
+        dbState.connected = false;
+        console.error("MongoDB connection failed, retrying in 5s:", error.message);
+        setTimeout(connectWithRetry, 5000);
     }
 }
 
@@ -148,7 +202,7 @@ process.on('SIGINT', async () => {
 });
 
 // GET method for getting the current logged in user
-app.get('/users/:uid', async (req, res) => {
+app.get('/users/:uid', requireDb, async (req, res) => {
     const { uid } = req.params;
 
     try {
@@ -169,7 +223,7 @@ app.get('/users/:uid', async (req, res) => {
 });
 
 // GET method for getting all users excluding admin
-app.get('/users', async (req, res) => {
+app.get('/users', requireAdmin, requireDb, async (req, res) => {
     try {
         const users = await allUsersCollection.find({
             userType: { $ne: "admin" }
@@ -178,16 +232,14 @@ app.get('/users', async (req, res) => {
         // Always return 200 with array
         res.status(200).json(users || []);
     } catch (error) {
-        console.error('Error fetching users:', error);
-        res.status(500).json({
-            error: 'Internal Server Error',
-            details: error.message
-        });
+        const requestId = crypto.randomUUID();
+        console.error(`[${requestId}] Error fetching users:`, error);
+        res.status(500).json({ error: 'Internal Server Error', requestId });
     }
 });
 
-app.post('/users', async (req, res) => {
-    const { name, email, photoURL, uid, userType } = req.body;
+app.post('/users', requireAdmin, validateUserRegistration, requireDb, async (req, res) => {
+    const { name, email, photoURL, uid } = req.body;
 
     try {
         // Check if the user already exists
@@ -196,33 +248,18 @@ app.post('/users', async (req, res) => {
             return res.status(400).json({ message: "User already exists!" });
         }
 
-        // Prepare the new user object, without the _id field as MongoDB generates it automatically
+        // Registration always creates an employee record. Roles change only
+        // through the admin-gated promotion endpoints.
         const newUser = {
             name,
             email,
             photoURL,
             uid,
-            userType,
-            createdAt: new Date(),  // Ensure this is stored as a Date object
+            userType: 'employee',
+            createdAt: new Date(),
         };
 
-        // Insert the user into the appropriate collection based on userType
-        let collection;
-        switch (newUser.userType) {
-            case "admin":
-                collection = adminCollection;
-                break;
-            case "hr":
-                collection = hrCollection;
-                break;
-            case "employee":
-            default:
-                collection = employeeCollection;
-                break;
-        }
-
-        // Insert the new user into the correct collection
-        await collection.insertOne(newUser);
+        await employeeCollection.insertOne(newUser);
         await allUsersCollection.insertOne(newUser);
 
         res.status(201).json({ message: "User registered successfully!" });
@@ -233,7 +270,7 @@ app.post('/users', async (req, res) => {
 });
 
 // Modify the fire endpoint in your backend
-app.post('/fire/:uid', async (req, res) => {
+app.post('/fire/:uid', requireAdmin, requireDb, async (req, res) => {
     const userId = req.params.uid;
 
     try {
@@ -294,13 +331,14 @@ app.post('/fire/:uid', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Error firing user:', error);
-        res.status(500).json({ error: `Error firing user: ${error.message}` });
+        const requestId = crypto.randomUUID();
+        console.error(`[${requestId}] Error firing user:`, error);
+        res.status(500).json({ error: 'Internal server error', requestId });
     }
 });
 
 // Add a new endpoint to check user status during login
-app.get('/check-user-status/:uid', async (req, res) => {
+app.get('/check-user-status/:uid', requireDb, async (req, res) => {
     const userId = req.params.uid;
 
     try {
@@ -326,7 +364,7 @@ app.get('/check-user-status/:uid', async (req, res) => {
 });
 
 // Enhanced make-hr endpoint
-app.post('/make-hr/:id', async (req, res) => {
+app.post('/make-hr/:id', requireAdmin, requireDb, async (req, res) => {
     const userId = req.params.id;
 
     try {
@@ -390,22 +428,21 @@ app.post('/make-hr/:id', async (req, res) => {
     }
 });
 
-app.post('/adjust-salary/:id', async (req, res) => {
-    const userId = req.params.id;
-    const { salary } = req.body;
-    try {
-        // Update salary in the database
-        await adjustSalary(userId, salary);
-        res.status(200).send('Salary adjusted');
-    } catch (error) {
-        res.status(500).send('Error adjusting salary');
-    }
+// Salary adjustment is not implemented. The old handler called a function that
+// does not exist and always crashed, so answer 501 until there is a real,
+// reviewed implementation behind this route.
+app.post('/adjust-salary/:id', requireAdmin, (req, res) => {
+    res.status(501).json({ error: 'Salary adjustment is not implemented' });
 });
 
 // Toggle employee verification status
-app.post('/toggle-verification/:id', async (req, res) => {
+app.post('/toggle-verification/:id', requireAdmin, requireDb, async (req, res) => {
     const { id } = req.params;
-    const { isVerified } = req.body;
+    const { isVerified } = req.body || {};
+
+    if (typeof isVerified !== 'boolean') {
+        return res.status(400).json({ error: 'isVerified must be a boolean' });
+    }
 
     try {
         const result = await allUsersCollection.updateOne(
@@ -425,7 +462,7 @@ app.post('/toggle-verification/:id', async (req, res) => {
 });
 
 // Get salary history for an employee
-app.get('/salary-history/:id', async (req, res) => {
+app.get('/salary-history/:id', requireAdmin, requireDb, async (req, res) => {
     try {
         // Get approved payments for the employee
         const salaryHistory = await paymentRequestsCollection
@@ -450,10 +487,29 @@ app.get('/salary-history/:id', async (req, res) => {
 });
 
 // Endpoint to add a new worksheet entry
-app.post('/worksheet', async (req, res) => {
+app.post('/worksheet', requireAdmin, requireDb, async (req, res) => {
     try {
+        const { task, hoursWorked, date, userId, email } = req.body || {};
+
+        if (typeof task !== 'string' || typeof userId !== 'string' || typeof email !== 'string') {
+            return res.status(400).json({ error: 'task, userId and email must be strings' });
+        }
+        const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+            ? Number(hoursWorked)
+            : hoursWorked;
+        if (typeof hours !== 'number' || !Number.isFinite(hours)) {
+            return res.status(400).json({ error: 'hoursWorked must be a number' });
+        }
+        if (typeof date !== 'string') {
+            return res.status(400).json({ error: 'date must be a string' });
+        }
+
         const worksheetEntry = {
-            ...req.body,
+            task,
+            hoursWorked: hours,
+            date,
+            userId,
+            email,
             createdAt: new Date()
         };
         const result = await worksheetCollection.insertOne(worksheetEntry);
@@ -471,7 +527,7 @@ app.post('/worksheet', async (req, res) => {
 });
 
 // Endpoint to get worksheet entries for a specific employee
-app.get('/worksheet/:email', async (req, res) => {
+app.get('/worksheet/:email', requireDb, async (req, res) => {
     try {
         const entries = await worksheetCollection
             .find({ email: req.params.email })
@@ -485,10 +541,48 @@ app.get('/worksheet/:email', async (req, res) => {
 });
 
 // Endpoint to update a worksheet entry
-app.put('/worksheet/:id', async (req, res) => {
+app.put('/worksheet/:id', requireAdmin, requireDb, async (req, res) => {
     try {
-        // Ensure that we're not modifying the _id field itself (it should stay as-is)
-        const { _id, ...updateFields } = req.body;
+        // Only these fields can be written. _id and anything else are ignored.
+        const { task, hoursWorked, date, userId, email } = req.body || {};
+        const updateFields = {};
+
+        if (task !== undefined) {
+            if (typeof task !== 'string') {
+                return res.status(400).json({ error: 'task must be a string' });
+            }
+            updateFields.task = task;
+        }
+        if (hoursWorked !== undefined) {
+            const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+                ? Number(hoursWorked)
+                : hoursWorked;
+            if (typeof hours !== 'number' || !Number.isFinite(hours)) {
+                return res.status(400).json({ error: 'hoursWorked must be a number' });
+            }
+            updateFields.hoursWorked = hours;
+        }
+        if (date !== undefined) {
+            if (typeof date !== 'string') {
+                return res.status(400).json({ error: 'date must be a string' });
+            }
+            updateFields.date = date;
+        }
+        if (userId !== undefined) {
+            if (typeof userId !== 'string') {
+                return res.status(400).json({ error: 'userId must be a string' });
+            }
+            updateFields.userId = userId;
+        }
+        if (email !== undefined) {
+            if (typeof email !== 'string') {
+                return res.status(400).json({ error: 'email must be a string' });
+            }
+            updateFields.email = email;
+        }
+        if (Object.keys(updateFields).length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
 
         // Proceed with the update, ensuring the _id remains unchanged
         const result = await worksheetCollection.updateOne(
@@ -509,7 +603,7 @@ app.put('/worksheet/:id', async (req, res) => {
 });
 
 // Endpoint to get all worksheet entries
-app.get('/worksheet', async (req, res) => {
+app.get('/worksheet', requireAdmin, requireDb, async (req, res) => {
     try {
         const entries = await worksheetCollection
             .find({})
@@ -523,7 +617,7 @@ app.get('/worksheet', async (req, res) => {
 });
 
 // Endpoint to delete a worksheet entry
-app.delete('/worksheet/:id', async (req, res) => {
+app.delete('/worksheet/:id', requireAdmin, requireDb, async (req, res) => {
     try {
         const result = await worksheetCollection.deleteOne({
             _id: new ObjectId(req.params.id)
@@ -539,7 +633,7 @@ app.delete('/worksheet/:id', async (req, res) => {
 });
 
 // Modified salary history endpoint with pagination
-app.get('/payment-history', async (req, res) => {
+app.get('/payment-history', requireAdmin, requireDb, async (req, res) => {
     try {
         // Fetch all payment requests from the collection
         const paymentHistory = await paymentRequestsCollection
@@ -558,7 +652,7 @@ app.get('/payment-history', async (req, res) => {
 });
 
 // Returns total of emplyee with email: email
-app.get('/payment-history/:email', async (req, res) => {
+app.get('/payment-history/:email', requireDb, async (req, res) => {
     try {
         const { email } = req.params; // Get email from the URL parameter
 
@@ -617,7 +711,7 @@ app.get('/payment-history/:email', async (req, res) => {
 });
 
 // Returns array of payments for this employee
-app.get('/payment-historya/:email', async (req, res) => {
+app.get('/payment-historya/:email', requireDb, async (req, res) => {
     try {
         const { email } = req.params; // Get email from the URL parameter
 
@@ -642,7 +736,7 @@ app.get('/payment-historya/:email', async (req, res) => {
 });
 
 // New endpoint to get total amount owed to employee (worksheetcollection)
-app.get('/employee-owed/:email', async (req, res) => {
+app.get('/employee-owed/:email', requireDb, async (req, res) => {
     try {
         const { email } = req.params;
 
@@ -707,17 +801,44 @@ app.get('/employee-owed/:email', async (req, res) => {
 });
 
 // Endpoint to process payment
-app.post('/process-payment', async (req, res) => {
-    const { email, amount, paidBy, entries } = req.body;
+app.post('/process-payment', requireAdmin, requireDb, async (req, res) => {
+    const { email, amount, paidBy, entries } = req.body || {};
+
+    if (typeof email !== 'string' || typeof paidBy !== 'string') {
+        return res.status(400).json({ error: 'email and paidBy must be strings' });
+    }
+    const amountValue = typeof amount === 'string' && amount.trim() !== '' ? Number(amount) : amount;
+    if (typeof amountValue !== 'number' || !Number.isFinite(amountValue) || amountValue <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+        return res.status(400).json({ error: 'entries must be a non-empty array' });
+    }
+    if (entries.some(entry => !entry || typeof entry._id !== 'string')) {
+        return res.status(400).json({ error: 'each entry must carry a string _id' });
+    }
+
+    let entryIds;
+    try {
+        entryIds = entries.map(entry => new ObjectId(entry._id));
+    } catch (error) {
+        return res.status(400).json({ error: 'entry _id values must be valid ObjectIds' });
+    }
 
     const session = client.startSession();
 
     try {
+        // Only rows that exist and belong to the claimed employee may be deleted.
+        const owned = await worksheetCollection.find({ _id: { $in: entryIds } }).toArray();
+        if (owned.length !== entryIds.length || owned.some(entry => entry.email !== email)) {
+            return res.status(400).json({ error: 'entries do not exist or do not belong to that employee' });
+        }
+
         await session.withTransaction(async () => {
             // Create payment record
             const paymentRecord = {
                 email,
-                amount,
+                amount: amountValue,
                 paidBy,
                 paidDate: new Date(),
                 status: 'pending',
@@ -727,9 +848,8 @@ app.post('/process-payment', async (req, res) => {
             await paymentRequestsCollection.insertOne(paymentRecord, { session });
 
             // Delete the paid worksheet entries
-            const entryIds = entries.map(entry => new ObjectId(entry._id));
             await worksheetCollection.deleteMany(
-                { _id: { $in: entryIds } },
+                { _id: { $in: entryIds }, email },
                 { session }
             );
         });
@@ -743,7 +863,7 @@ app.post('/process-payment', async (req, res) => {
     }
 });
 
-app.get('/check-pending-payment/:email', async (req, res) => {
+app.get('/check-pending-payment/:email', requireDb, async (req, res) => {
     try {
         const { email } = req.params;
 
@@ -764,9 +884,9 @@ app.get('/check-pending-payment/:email', async (req, res) => {
 });
 
 // Endpoint for admin to approve/reject payment requests
-app.put('/approve-payment/:paymentId', async (req, res) => {
+app.put('/approve-payment/:paymentId', requireAdmin, requireDb, async (req, res) => {
     const { paymentId } = req.params;
-    const { status } = req.body; // 'paid' or 'pending'
+    const { status } = req.body || {}; // 'paid' or 'pending'
 
     if (!['paid', 'pending'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status value. Must be "paid" or "pending".' });
@@ -808,5 +928,13 @@ app.put('/approve-payment/:paymentId', async (req, res) => {
     }
 });
 
-run().catch(console.dir);
+connectWithRetry();
+
+// Vercel imports the exported app. A plain `node index.js` run listens on a port.
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`Server running on PORT: ${port}`);
+    });
+}
+
 module.exports = app;
