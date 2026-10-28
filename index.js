@@ -2,13 +2,115 @@ require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
+const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+
 const app = express();
 const port = process.env.PORT || 5000;
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-// Add this at the start of your backend file to verify env variables
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PW}@cluster0.oyqb2.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
-// Middleware
+// ---------------------------------------------------------------------------
+// Tunables. Limits are deliberately small: this API serves a company roster,
+// not an analytics warehouse.
+// ---------------------------------------------------------------------------
+const DEFAULT_LIMIT = 200;
+const MAX_LIMIT = 200;
+// Ceiling for reads that feed an in-process total (per employee only).
+const INTERNAL_FETCH_CAP = 5000;
+const MAX_BODY = '100kb';
+const RATE_WINDOW_MS = 60 * 1000;
+const RATE_MAX = (() => {
+    const n = Number(process.env.RATE_LIMIT_MAX);
+    return Number.isInteger(n) && n >= 1 && n <= 100000 ? n : 120;
+})();
+const MAXLEN = {
+    name: 200,
+    email: 254,
+    uid: 128,
+    url: 2048,
+    text: 5000,
+    task: 500,
+    date: 40,
+    status: 32,
+    heading: 200,
+    designation: 100,
+    paidBy: 200,
+    entries: 500,
+};
+
+// ---------------------------------------------------------------------------
+// Small pure helpers (exported at the bottom so the verify script can unit
+// test them without a database).
+// ---------------------------------------------------------------------------
+
+// Express 4 does not catch rejected promises from handlers. Wrapping keeps a
+// stray rejection from becoming an unhandledRejection and killing the process.
+function asyncHandler(fn) {
+    return (req, res, next) => {
+        Promise.resolve(fn(req, res, next)).catch(next);
+    };
+}
+
+// new ObjectId(undefined) silently mints a fresh id in mongodb 5.x, and
+// new ObjectId({}) can cast operator objects. Only accept 24 hex characters.
+function isValidObjectId(value) {
+    return typeof value === 'string' && /^[0-9a-fA-F]{24}$/.test(value);
+}
+
+// ?limit= for list endpoints: default DEFAULT_LIMIT, capped at MAX_LIMIT,
+// null when the caller sent something that is not a positive integer.
+function parseLimit(raw) {
+    if (raw === undefined || raw === '') return DEFAULT_LIMIT;
+    if (typeof raw !== 'string' || !/^\d{1,6}$/.test(raw)) return null;
+    const n = Number(raw);
+    if (n < 1) return null;
+    return Math.min(n, MAX_LIMIT);
+}
+
+function isStr(value, max) {
+    return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+function isOptStr(value, max) {
+    return value === undefined || (typeof value === 'string' && value.length <= max);
+}
+
+// In-memory fixed-window rate limiter keyed by client address. One bucket per
+// address per minute; enough for a single-process portfolio API. Multi-instance
+// deployments need a shared store (see README).
+function makeRateLimiter(windowMs, max) {
+    const buckets = new Map();
+    return function rateLimit(req, res, next) {
+        const now = Date.now();
+        const key = req.ip || req.socket.remoteAddress || 'unknown';
+        let bucket = buckets.get(key);
+        if (!bucket || now - bucket.start >= windowMs) {
+            bucket = { start: now, count: 0 };
+            buckets.set(key, bucket);
+        }
+        bucket.count += 1;
+        if (buckets.size > 10000) {
+            for (const [k, b] of buckets) {
+                if (now - b.start >= windowMs) buckets.delete(k);
+            }
+        }
+        if (bucket.count > max) {
+            res.setHeader('Retry-After', String(Math.ceil((bucket.start + windowMs - now) / 1000)));
+            return res.status(429).json({ error: 'Too many requests' });
+        }
+        next();
+    };
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB connection string. MONGO_URI wins; otherwise the credentials are
+// stitched together. MONGO_CLUSTER replaces the hardcoded Atlas hostname.
+// ---------------------------------------------------------------------------
+const uri = process.env.MONGO_URI
+    || `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PW}@${process.env.MONGO_CLUSTER || 'cluster0.oyqb2.mongodb.net'}/?retryWrites=true&w=majority&appName=Cluster0`;
+
+// ---------------------------------------------------------------------------
+// CORS. Browser hygiene only, never an authorization boundary. x-admin-token
+// must be listed or preflight strips it from real browser calls.
+// ---------------------------------------------------------------------------
 const allowedOrigins = [
     'https://worksync-2ca3b.web.app',
     'https://worksync-2ca3b.firebaseapp.com',
@@ -20,22 +122,46 @@ const corsOptions = {
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
-            callback(new Error('Not allowed by CORS'));
+            // Not an error path: refuse the origin without a 500.
+            callback(null, false);
         }
     },
-    credentials: true, // This is crucial
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token']
 };
+
+// ---------------------------------------------------------------------------
+// Cross-cutting middleware. Order matters: ids and headers first, then body
+// parsing and rate limiting, then routes. The error handler sits after the
+// routes so it can actually see their failures.
+// ---------------------------------------------------------------------------
+app.use((req, res, next) => {
+    req.id = crypto.randomUUID();
+    const start = Date.now();
+    res.setHeader('X-Request-Id', req.id);
+    res.on('finish', () => {
+        console.log(`[${req.id}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+    });
+    next();
+});
+
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+});
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: MAX_BODY }));
 
-app.use((err, req, res, next) => {
-    const requestId = crypto.randomUUID();
-    console.error(`[${requestId}] Error stack:`, err.stack); // Log the full error stack
-    res.status(500).json({ error: 'Internal server error', requestId });
+const rateLimit = makeRateLimiter(RATE_WINDOW_MS, RATE_MAX);
+app.use((req, res, next) => {
+    // Health probes must stay answerable under load or after a scrape burst.
+    if (req.method === 'GET' && req.path === '/') return next();
+    return rateLimit(req, res, next);
 });
 
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -76,6 +202,8 @@ function safeEqual(a, b) {
 // Shared-secret gate for privileged operations. Callers must send the
 // x-admin-token header matching the ADMIN_TOKEN env var. When ADMIN_TOKEN is
 // empty or absent every route behind this middleware is disabled with 503.
+// The server never reads a role out of the request: privileged actions are
+// gated by this secret, and roles written to the database are decided here.
 function requireAdmin(req, res, next) {
     const expected = process.env.ADMIN_TOKEN;
     if (!expected) {
@@ -88,16 +216,47 @@ function requireAdmin(req, res, next) {
     next();
 }
 
+// ---------------------------------------------------------------------------
+// Trust-boundary validators. These run before requireDb so bad input answers
+// 400 even when the database is down, and so no operator object or oversized
+// string ever reaches a query.
+// ---------------------------------------------------------------------------
+
+function requireObjectIdParam(name) {
+    return (req, res, next) => {
+        if (!isValidObjectId(req.params[name])) {
+            return res.status(400).json({ error: `${name} must be a 24 character hex id` });
+        }
+        next();
+    };
+}
+
+function requireStringParam(name, max) {
+    return (req, res, next) => {
+        if (!isStr(req.params[name], max)) {
+            return res.status(400).json({ error: `${name} must be a non-empty string of at most ${max} characters` });
+        }
+        next();
+    };
+}
+
+function validateListQuery(req, res, next) {
+    if (parseLimit(req.query.limit) === null) {
+        return res.status(400).json({ error: 'limit must be a positive integer' });
+    }
+    next();
+}
+
 // Boundary check for user creation. Self-registration only ever creates
 // employees: promotion to hr happens via /make-hr, and nothing here can create
-// an admin record. Runs before requireDb so bad input fails fast.
+// an admin record. Extra fields are ignored, never spread into the document.
 function validateUserRegistration(req, res, next) {
     const { name, email, photoURL, uid, userType } = req.body || {};
-    if (typeof name !== 'string' || typeof email !== 'string' || typeof uid !== 'string') {
-        return res.status(400).json({ message: 'name, email and uid must be strings' });
+    if (!isStr(name, MAXLEN.name) || !isStr(email, MAXLEN.email) || !isStr(uid, MAXLEN.uid)) {
+        return res.status(400).json({ message: 'name, email and uid must be strings within length limits' });
     }
-    if (photoURL !== undefined && typeof photoURL !== 'string') {
-        return res.status(400).json({ message: 'photoURL must be a string' });
+    if (!isOptStr(photoURL, MAXLEN.url)) {
+        return res.status(400).json({ message: 'photoURL must be a string within length limits' });
     }
     const requestedType = userType === undefined ? 'employee' : userType;
     if (requestedType !== 'employee') {
@@ -106,7 +265,113 @@ function validateUserRegistration(req, res, next) {
     next();
 }
 
-// Health check. Answers even when MongoDB is unreachable.
+function validateQuerySubmission(req, res, next) {
+    const { heading, designation, details, email, submittedAt } = req.body || {};
+    if (!isStr(heading, MAXLEN.heading) || !isStr(designation, MAXLEN.designation)
+        || !isStr(details, MAXLEN.text) || !isStr(email, MAXLEN.email)) {
+        return res.status(400).json({ error: 'heading, designation, details and email must be strings within length limits' });
+    }
+    if (submittedAt !== undefined
+        && !(typeof submittedAt === 'string' && isStr(submittedAt, MAXLEN.date) && !Number.isNaN(Date.parse(submittedAt)))) {
+        return res.status(400).json({ error: 'submittedAt must be a parseable date string' });
+    }
+    next();
+}
+
+function validateWorksheetBody(req, res, next) {
+    const { task, hoursWorked, date, userId, email } = req.body || {};
+    if (!isStr(task, MAXLEN.task) || !isStr(userId, MAXLEN.uid) || !isStr(email, MAXLEN.email)) {
+        return res.status(400).json({ error: 'task, userId and email must be strings within length limits' });
+    }
+    const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+        ? Number(hoursWorked)
+        : hoursWorked;
+    if (typeof hours !== 'number' || !Number.isFinite(hours)) {
+        return res.status(400).json({ error: 'hoursWorked must be a number' });
+    }
+    if (!isStr(date, MAXLEN.date)) {
+        return res.status(400).json({ error: 'date must be a string' });
+    }
+    next();
+}
+
+function validateWorksheetUpdate(req, res, next) {
+    const body = req.body || {};
+    const { task, hoursWorked, date, userId, email } = body;
+    if (task !== undefined && !isStr(task, MAXLEN.task)) {
+        return res.status(400).json({ error: 'task must be a string within length limits' });
+    }
+    if (hoursWorked !== undefined) {
+        const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+            ? Number(hoursWorked)
+            : hoursWorked;
+        if (typeof hours !== 'number' || !Number.isFinite(hours)) {
+            return res.status(400).json({ error: 'hoursWorked must be a number' });
+        }
+    }
+    if (date !== undefined && !isStr(date, MAXLEN.date)) {
+        return res.status(400).json({ error: 'date must be a string' });
+    }
+    if (userId !== undefined && !isStr(userId, MAXLEN.uid)) {
+        return res.status(400).json({ error: 'userId must be a string within length limits' });
+    }
+    if (email !== undefined && !isStr(email, MAXLEN.email)) {
+        return res.status(400).json({ error: 'email must be a string within length limits' });
+    }
+    next();
+}
+
+function validatePaymentBody(req, res, next) {
+    const { email, amount, paidBy, entries } = req.body || {};
+    if (!isStr(email, MAXLEN.email) || !isStr(paidBy, MAXLEN.paidBy)) {
+        return res.status(400).json({ error: 'email and paidBy must be strings within length limits' });
+    }
+    const amountValue = typeof amount === 'string' && amount.trim() !== '' ? Number(amount) : amount;
+    if (typeof amountValue !== 'number' || !Number.isFinite(amountValue) || amountValue <= 0) {
+        return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!Array.isArray(entries) || entries.length === 0 || entries.length > MAXLEN.entries) {
+        return res.status(400).json({ error: `entries must be a non-empty array of at most ${MAXLEN.entries} items` });
+    }
+    if (entries.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry) || !isValidObjectId(entry._id))) {
+        return res.status(400).json({ error: 'each entry must carry a 24 character hex _id' });
+    }
+    next();
+}
+
+function validateVerificationBody(req, res, next) {
+    const { isVerified } = req.body || {};
+    if (typeof isVerified !== 'boolean') {
+        return res.status(400).json({ error: 'isVerified must be a boolean' });
+    }
+    next();
+}
+
+function validateApprovePaymentBody(req, res, next) {
+    const { status } = req.body || {};
+    if (!['paid', 'pending'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status value. Must be "paid" or "pending".' });
+    }
+    next();
+}
+
+function validateQueriesQuery(req, res, next) {
+    const { email } = req.query;
+    if (email !== undefined && !isStr(email, MAXLEN.email)) {
+        return res.status(400).json({ error: 'email must be a string within length limits' });
+    }
+    if (parseLimit(req.query.limit) === null) {
+        return res.status(400).json({ error: 'limit must be a positive integer' });
+    }
+    next();
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+// Health check. Reads a cached flag only, never touches the database, so it
+// stays cheap and keeps answering while MongoDB is unreachable.
 app.get('/', (req, res) => {
     if (dbState.connected) {
         return res.status(200).json({ status: 'ok', database: 'connected' });
@@ -114,63 +379,54 @@ app.get('/', (req, res) => {
     res.status(503).json({ status: 'degraded', database: 'disconnected' });
 });
 
-app.post('/submit-query', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const { heading, designation, details, submittedAt, email } = req.body || {};
+// Probe used by verify-security.sh to prove an async handler rejection cannot
+// kill the process. Not registered outside verification runs.
+if (process.env.VERIFY_ASYNC_ROUTE === '1') {
+    app.get('/__verify/async-reject', asyncHandler(async () => {
+        throw new Error('verify: intentional async rejection');
+    }));
+}
 
-        // Create query document
-        const queryDocument = {
-            heading,
-            designation,
-            details,
-            email,
-            status: 'pending',
-            submittedAt: new Date(submittedAt),
-            updatedAt: new Date()
-        };
+app.post('/submit-query', requireAdmin, validateQuerySubmission, requireDb, asyncHandler(async (req, res) => {
+    const { heading, designation, details, submittedAt, email } = req.body;
 
-        // Insert into Queries collection
-        const result = await queriesCollection.insertOne(queryDocument);
+    const queryDocument = {
+        heading,
+        designation,
+        details,
+        email,
+        status: 'pending',
+        submittedAt: submittedAt === undefined ? new Date() : new Date(submittedAt),
+        updatedAt: new Date()
+    };
 
-        if (!result.insertedId) {
-            throw new Error('Failed to insert query');
-        }
-
-        res.status(201).json({
-            message: 'Query submitted successfully',
-            queryId: result.insertedId
-        });
-
-    } catch (error) {
-        console.error('Error submitting query:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    const result = await queriesCollection.insertOne(queryDocument);
+    if (!result.insertedId) {
+        throw new Error('Failed to insert query');
     }
-});
 
-app.get('/queries', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const { email } = req.query;
+    res.status(201).json({
+        message: 'Query submitted successfully',
+        queryId: result.insertedId
+    });
+}));
 
-        if (email !== undefined && typeof email !== 'string') {
-            return res.status(400).json({ error: 'email must be a string' });
-        }
+app.get('/queries', requireAdmin, validateQueriesQuery, requireDb, asyncHandler(async (req, res) => {
+    const { email } = req.query;
 
-        const filter = {};
-        if (email) {
-            filter.email = email;
-        }
-
-        const queries = await queriesCollection
-            .find(filter)
-            .sort({ submittedAt: -1 })
-            .toArray();
-
-        res.status(200).json(queries);
-    } catch (error) {
-        console.error('Error fetching queries:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    const filter = {};
+    if (email) {
+        filter.email = email;
     }
-});
+
+    const queries = await queriesCollection
+        .find(filter)
+        .sort({ submittedAt: -1 })
+        .limit(parseLimit(req.query.limit))
+        .toArray();
+
+    res.status(200).json(queries);
+}));
 
 // Connect to MongoDB with retry and backoff. A failed connect must never kill
 // the process: routes gated on requireDb answer 503 until the connection is up.
@@ -189,244 +445,171 @@ async function connectWithRetry() {
     }
 }
 
-// Proper cleanup
-process.on('SIGINT', async () => {
-    await client.close(); // Ensure this is uncommented
-    process.exit();
-});
-
-// Proper cleanup
-process.on('SIGINT', async () => {
-    // await client.close();
-    process.exit();
-});
-
 // GET method for getting the current logged in user
-app.get('/users/:uid', requireDb, async (req, res) => {
-    const { uid } = req.params;
+app.get('/users/:uid', requireStringParam('uid', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
+    const user = await allUsersCollection.findOne({ uid: req.params.uid });
 
-    try {
-        const user = await allUsersCollection.findOne({ uid: uid });
-
-        // Add cache control headers
-        res.setHeader('Cache-Control', 'no-store, max-age=0');
-
-        if (user) {
-            res.status(200).json(user);
-        } else {
-            res.status(404).json({ error: 'No record found' });
-        }
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+    if (user) {
+        res.status(200).json(user);
+    } else {
+        res.status(404).json({ error: 'No record found' });
     }
-});
+}));
 
 // GET method for getting all users excluding admin
-app.get('/users', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const users = await allUsersCollection.find({
-            userType: { $ne: "admin" }
-        }).toArray();
+app.get('/users', requireAdmin, validateListQuery, requireDb, asyncHandler(async (req, res) => {
+    const users = await allUsersCollection.find({
+        userType: { $ne: "admin" }
+    })
+        .limit(parseLimit(req.query.limit))
+        .toArray();
 
-        // Always return 200 with array
-        res.status(200).json(users || []);
-    } catch (error) {
-        const requestId = crypto.randomUUID();
-        console.error(`[${requestId}] Error fetching users:`, error);
-        res.status(500).json({ error: 'Internal Server Error', requestId });
-    }
-});
+    // Always return 200 with array
+    res.status(200).json(users || []);
+}));
 
-app.post('/users', requireAdmin, validateUserRegistration, requireDb, async (req, res) => {
+app.post('/users', requireAdmin, validateUserRegistration, requireDb, asyncHandler(async (req, res) => {
+    // Only these fields are stored. Any role-ish field in the body is dropped;
+    // userType is decided here, never taken from the caller.
     const { name, email, photoURL, uid } = req.body;
 
-    try {
-        // Check if the user already exists
-        const existingUser = await allUsersCollection.findOne({ email });
-        if (existingUser) {
-            return res.status(400).json({ message: "User already exists!" });
-        }
-
-        // Registration always creates an employee record. Roles change only
-        // through the admin-gated promotion endpoints.
-        const newUser = {
-            name,
-            email,
-            photoURL,
-            uid,
-            userType: 'employee',
-            createdAt: new Date(),
-        };
-
-        await employeeCollection.insertOne(newUser);
-        await allUsersCollection.insertOne(newUser);
-
-        res.status(201).json({ message: "User registered successfully!" });
-    } catch (error) {
-        console.error("Error saving user:", error);
-        res.status(500).json({ message: "Internal server error" });
+    // Check if the user already exists
+    const existingUser = await allUsersCollection.findOne({ email });
+    if (existingUser) {
+        return res.status(400).json({ message: "User already exists!" });
     }
-});
 
-// Modify the fire endpoint in your backend
-app.post('/fire/:uid', requireAdmin, requireDb, async (req, res) => {
+    const newUser = {
+        name,
+        email,
+        photoURL,
+        uid,
+        userType: 'employee',
+        createdAt: new Date(),
+    };
+
+    await employeeCollection.insertOne(newUser);
+    await allUsersCollection.insertOne(newUser);
+
+    res.status(201).json({ message: "User registered successfully!" });
+}));
+
+app.post('/fire/:uid', requireAdmin, requireStringParam('uid', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
     const userId = req.params.uid;
 
-    try {
-        if (!userId) {
-            return res.status(400).json({ error: 'No user ID provided' });
-        }
+    // First find the user to determine their type. The role comes from the
+    // stored record, never from the request.
+    const user = await allUsersCollection.findOne({ uid: userId });
 
-        console.log('Firing user:', userId);
-
-        // First find the user to determine their type
-        const user = await allUsersCollection.findOne({ uid: userId });
-
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        // Determine which specific collection to update based on user type
-        let specificCollection;
-        switch (user.userType?.toLowerCase()) {
-            case 'hr':
-                specificCollection = hrCollection;
-                break;
-            case 'admin':
-                specificCollection = adminCollection;
-                break;
-            case 'employee':
-            default:
-                specificCollection = employeeCollection;
-                break;
-        }
-
-        // Update both the specific collection and the main Users collection
-        const updatePromises = [
-            // Update in specific collection (HR, Admin, or Employee)
-            specificCollection.updateOne(
-                { uid: userId },
-                { $set: { status: 'fired' } }
-            ),
-            // Update in main Users collection
-            allUsersCollection.updateOne(
-                { uid: userId },
-                { $set: { status: 'fired' } }
-            )
-        ];
-
-        await Promise.all(updatePromises);
-
-        // Fetch the updated user to verify the change
-        const updatedUser = await allUsersCollection.findOne({ uid: userId });
-
-        // Fetch the updated lists to send back to frontend
-        const updatedUsers = await allUsersCollection.find({}).toArray();
-
-        res.status(200).json({
-            message: 'User fired successfully',
-            user: updatedUser,
-            updatedUsers: updatedUsers
-        });
-
-    } catch (error) {
-        const requestId = crypto.randomUUID();
-        console.error(`[${requestId}] Error firing user:`, error);
-        res.status(500).json({ error: 'Internal server error', requestId });
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
     }
-});
+
+    let specificCollection;
+    switch (user.userType?.toLowerCase()) {
+        case 'hr':
+            specificCollection = hrCollection;
+            break;
+        case 'admin':
+            specificCollection = adminCollection;
+            break;
+        case 'employee':
+        default:
+            specificCollection = employeeCollection;
+            break;
+    }
+
+    await Promise.all([
+        specificCollection.updateOne(
+            { uid: userId },
+            { $set: { status: 'fired' } }
+        ),
+        allUsersCollection.updateOne(
+            { uid: userId },
+            { $set: { status: 'fired' } }
+        )
+    ]);
+
+    const updatedUser = await allUsersCollection.findOne({ uid: userId });
+    const updatedUsers = await allUsersCollection
+        .find({})
+        .limit(DEFAULT_LIMIT)
+        .toArray();
+
+    res.status(200).json({
+        message: 'User fired successfully',
+        user: updatedUser,
+        updatedUsers: updatedUsers
+    });
+}));
 
 // Add a new endpoint to check user status during login
-app.get('/check-user-status/:uid', requireDb, async (req, res) => {
-    const userId = req.params.uid;
+app.get('/check-user-status/:uid', requireStringParam('uid', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
+    const user = await allUsersCollection.findOne({ uid: req.params.uid });
 
-    try {
-        const user = await allUsersCollection.findOne({ uid: userId });
-
-        // Add CORS headers explicitly
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control');
-        res.header('Access-Control-Allow-Origin', 'https://worksync-2ca3b.web.app');
-        res.header('Access-Control-Allow-Credentials', 'true');
-
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        res.status(200).json({
-            status: user.status || 'active',
-            userType: user.userType
-        });
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({ error: 'Internal Server Error' });
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
     }
-});
+
+    res.status(200).json({
+        status: user.status || 'active',
+        userType: user.userType
+    });
+}));
 
 // Enhanced make-hr endpoint
-app.post('/make-hr/:id', requireAdmin, requireDb, async (req, res) => {
+app.post('/make-hr/:id', requireAdmin, requireObjectIdParam('id'), requireDb, asyncHandler(async (req, res) => {
     const userId = req.params.id;
 
-    try {
-        // First, find the user in the main Users collection
-        const user = await allUsersCollection.findOne({ _id: new ObjectId(userId) });
+    // First, find the user in the main Users collection
+    const user = await allUsersCollection.findOne({ _id: new ObjectId(userId) });
 
-        if (!user) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        // Create user object for HR collection
-        const hrUser = {
-            ...user,
-            userType: 'hr',
-            promotedAt: new Date()
-        };
-
-        // Start a session for transaction
-        const session = client.startSession();
-
-        try {
-            await session.withTransaction(async () => {
-                // Remove from employee collection if they were an employee
-                if (user.userType === 'employee') {
-                    await employeeCollection.deleteOne({ _id: new ObjectId(userId) }, { session });
-                }
-
-                // Insert into HR collection
-                await hrCollection.insertOne(hrUser, { session });
-
-                // Update main Users collection
-                await allUsersCollection.updateOne(
-                    { _id: new ObjectId(userId) },
-                    {
-                        $set: {
-                            userType: 'hr',
-                            promotedAt: new Date()
-                        }
-                    },
-                    { session }
-                );
-            });
-
-            // Fetch updated user list
-            const updatedUsers = await allUsersCollection
-                .find({ userType: { $ne: "admin" } })
-                .toArray();
-
-            res.status(200).json({
-                message: 'User successfully promoted to HR',
-                updatedUsers: updatedUsers
-            });
-
-        } finally {
-            await session.endSession();
-        }
-
-    } catch (error) {
-        console.error('Error promoting user to HR:', error);
-        res.status(500).json({ error: 'Internal server error while promoting user' });
+    if (!user) {
+        return res.status(404).json({ error: 'User not found' });
     }
-});
+
+    const hrUser = {
+        ...user,
+        userType: 'hr',
+        promotedAt: new Date()
+    };
+
+    const session = client.startSession();
+
+    try {
+        await session.withTransaction(async () => {
+            // Remove from employee collection if they were an employee
+            if (user.userType === 'employee') {
+                await employeeCollection.deleteOne({ _id: new ObjectId(userId) }, { session });
+            }
+
+            await hrCollection.insertOne(hrUser, { session });
+
+            await allUsersCollection.updateOne(
+                { _id: new ObjectId(userId) },
+                {
+                    $set: {
+                        userType: 'hr',
+                        promotedAt: new Date()
+                    }
+                },
+                { session }
+            );
+        });
+    } finally {
+        await session.endSession();
+    }
+
+    const updatedUsers = await allUsersCollection
+        .find({ userType: { $ne: "admin" } })
+        .limit(DEFAULT_LIMIT)
+        .toArray();
+
+    res.status(200).json({
+        message: 'User successfully promoted to HR',
+        updatedUsers: updatedUsers
+    });
+}));
 
 // Salary adjustment is not implemented. The old handler called a function that
 // does not exist and always crashed, so answer 501 until there is a real,
@@ -436,497 +619,396 @@ app.post('/adjust-salary/:id', requireAdmin, (req, res) => {
 });
 
 // Toggle employee verification status
-app.post('/toggle-verification/:id', requireAdmin, requireDb, async (req, res) => {
-    const { id } = req.params;
-    const { isVerified } = req.body || {};
+app.post('/toggle-verification/:id', requireAdmin, requireObjectIdParam('id'), validateVerificationBody, requireDb, asyncHandler(async (req, res) => {
+    const result = await allUsersCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { isVerified: req.body.isVerified } }
+    );
 
-    if (typeof isVerified !== 'boolean') {
-        return res.status(400).json({ error: 'isVerified must be a boolean' });
+    if (result.modifiedCount === 0) {
+        return res.status(404).json({ error: 'Employee not found' });
     }
 
-    try {
-        const result = await allUsersCollection.updateOne(
-            { _id: new ObjectId(id) },
-            { $set: { isVerified } }
-        );
-
-        if (result.modifiedCount === 0) {
-            return res.status(404).json({ error: 'Employee not found' });
-        }
-
-        res.status(200).json({ message: 'Verification status updated successfully' });
-    } catch (error) {
-        console.error('Error updating verification status:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json({ message: 'Verification status updated successfully' });
+}));
 
 // Get salary history for an employee
-app.get('/salary-history/:id', requireAdmin, requireDb, async (req, res) => {
-    try {
-        // Get approved payments for the employee
-        const salaryHistory = await paymentRequestsCollection
-            .find({
-                employeeId: req.params.id,
-                status: 'approved'
-            })
-            .sort({ year: 1, month: 1 })
-            .toArray();
+app.get('/salary-history/:id', requireAdmin, requireStringParam('id', MAXLEN.uid), requireDb, asyncHandler(async (req, res) => {
+    // Get approved payments for the employee
+    const salaryHistory = await paymentRequestsCollection
+        .find({
+            employeeId: req.params.id,
+            status: 'approved'
+        })
+        .sort({ year: 1, month: 1 })
+        .limit(INTERNAL_FETCH_CAP)
+        .toArray();
 
-        // Transform data for the chart
-        const formattedHistory = salaryHistory.map(payment => ({
-            month: `${payment.month} ${payment.year}`,
-            salary: payment.salary
-        }));
+    // Transform data for the chart
+    const formattedHistory = salaryHistory.map(payment => ({
+        month: `${payment.month} ${payment.year}`,
+        salary: payment.salary
+    }));
 
-        res.status(200).json(formattedHistory);
-    } catch (error) {
-        console.error('Error fetching salary history:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json(formattedHistory);
+}));
 
 // Endpoint to add a new worksheet entry
-app.post('/worksheet', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const { task, hoursWorked, date, userId, email } = req.body || {};
+app.post('/worksheet', requireAdmin, validateWorksheetBody, requireDb, asyncHandler(async (req, res) => {
+    const { task, hoursWorked, date, userId, email } = req.body;
 
-        if (typeof task !== 'string' || typeof userId !== 'string' || typeof email !== 'string') {
-            return res.status(400).json({ error: 'task, userId and email must be strings' });
-        }
-        const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
-            ? Number(hoursWorked)
-            : hoursWorked;
-        if (typeof hours !== 'number' || !Number.isFinite(hours)) {
-            return res.status(400).json({ error: 'hoursWorked must be a number' });
-        }
-        if (typeof date !== 'string') {
-            return res.status(400).json({ error: 'date must be a string' });
-        }
+    const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+        ? Number(hoursWorked)
+        : hoursWorked;
 
-        const worksheetEntry = {
-            task,
-            hoursWorked: hours,
-            date,
-            userId,
-            email,
-            createdAt: new Date()
-        };
-        const result = await worksheetCollection.insertOne(worksheetEntry);
-        if (!result.insertedId) {
-            throw new Error('Failed to create worksheet entry');
-        }
-        res.status(201).json({
-            message: 'Worksheet entry created successfully',
-            entry: { ...worksheetEntry, _id: result.insertedId }
-        });
-    } catch (error) {
-        console.error('Error creating worksheet entry:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    const worksheetEntry = {
+        task,
+        hoursWorked: hours,
+        date,
+        userId,
+        email,
+        createdAt: new Date()
+    };
+    const result = await worksheetCollection.insertOne(worksheetEntry);
+    if (!result.insertedId) {
+        throw new Error('Failed to create worksheet entry');
     }
-});
+    res.status(201).json({
+        message: 'Worksheet entry created successfully',
+        entry: { ...worksheetEntry, _id: result.insertedId }
+    });
+}));
 
 // Endpoint to get worksheet entries for a specific employee
-app.get('/worksheet/:email', requireDb, async (req, res) => {
-    try {
-        const entries = await worksheetCollection
-            .find({ email: req.params.email })
-            .sort({ date: -1 })
-            .toArray();
-        res.status(200).json(entries);
-    } catch (error) {
-        console.error('Error fetching worksheet entries:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+app.get('/worksheet/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+    const entries = await worksheetCollection
+        .find({ email: req.params.email })
+        .sort({ date: -1 })
+        .limit(INTERNAL_FETCH_CAP)
+        .toArray();
+    res.status(200).json(entries);
+}));
 
 // Endpoint to update a worksheet entry
-app.put('/worksheet/:id', requireAdmin, requireDb, async (req, res) => {
-    try {
-        // Only these fields can be written. _id and anything else are ignored.
-        const { task, hoursWorked, date, userId, email } = req.body || {};
-        const updateFields = {};
+app.put('/worksheet/:id', requireAdmin, requireObjectIdParam('id'), validateWorksheetUpdate, requireDb, asyncHandler(async (req, res) => {
+    // Only these fields can be written. _id and anything else are ignored.
+    const { task, hoursWorked, date, userId, email } = req.body || {};
+    const updateFields = {};
 
-        if (task !== undefined) {
-            if (typeof task !== 'string') {
-                return res.status(400).json({ error: 'task must be a string' });
-            }
-            updateFields.task = task;
-        }
-        if (hoursWorked !== undefined) {
-            const hours = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
-                ? Number(hoursWorked)
-                : hoursWorked;
-            if (typeof hours !== 'number' || !Number.isFinite(hours)) {
-                return res.status(400).json({ error: 'hoursWorked must be a number' });
-            }
-            updateFields.hoursWorked = hours;
-        }
-        if (date !== undefined) {
-            if (typeof date !== 'string') {
-                return res.status(400).json({ error: 'date must be a string' });
-            }
-            updateFields.date = date;
-        }
-        if (userId !== undefined) {
-            if (typeof userId !== 'string') {
-                return res.status(400).json({ error: 'userId must be a string' });
-            }
-            updateFields.userId = userId;
-        }
-        if (email !== undefined) {
-            if (typeof email !== 'string') {
-                return res.status(400).json({ error: 'email must be a string' });
-            }
-            updateFields.email = email;
-        }
-        if (Object.keys(updateFields).length === 0) {
-            return res.status(400).json({ error: 'No valid fields to update' });
-        }
-
-        // Proceed with the update, ensuring the _id remains unchanged
-        const result = await worksheetCollection.updateOne(
-            { _id: new ObjectId(req.params.id) }, // Match the document by _id
-            { $set: updateFields } // Only set the fields provided, excluding _id
-        );
-
-        // Check if any document was modified
-        if (result.modifiedCount === 0) {
-            return res.status(404).json({ error: 'Entry not found or no changes made' });
-        }
-
-        res.status(200).json({ message: 'Entry updated successfully' });
-    } catch (error) {
-        console.error('Error updating worksheet entry:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    if (task !== undefined) {
+        updateFields.task = task;
     }
-});
+    if (hoursWorked !== undefined) {
+        updateFields.hoursWorked = typeof hoursWorked === 'string' && hoursWorked.trim() !== ''
+            ? Number(hoursWorked)
+            : hoursWorked;
+    }
+    if (date !== undefined) {
+        updateFields.date = date;
+    }
+    if (userId !== undefined) {
+        updateFields.userId = userId;
+    }
+    if (email !== undefined) {
+        updateFields.email = email;
+    }
+    if (Object.keys(updateFields).length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    const result = await worksheetCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: updateFields }
+    );
+
+    if (result.modifiedCount === 0) {
+        return res.status(404).json({ error: 'Entry not found or no changes made' });
+    }
+
+    res.status(200).json({ message: 'Entry updated successfully' });
+}));
 
 // Endpoint to get all worksheet entries
-app.get('/worksheet', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const entries = await worksheetCollection
-            .find({})
-            .sort({ date: -1 })
-            .toArray();
-        res.status(200).json(entries);
-    } catch (error) {
-        console.error('Error fetching worksheet entries:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+app.get('/worksheet', requireAdmin, validateListQuery, requireDb, asyncHandler(async (req, res) => {
+    const entries = await worksheetCollection
+        .find({})
+        .sort({ date: -1 })
+        .limit(parseLimit(req.query.limit))
+        .toArray();
+    res.status(200).json(entries);
+}));
 
 // Endpoint to delete a worksheet entry
-app.delete('/worksheet/:id', requireAdmin, requireDb, async (req, res) => {
-    try {
-        const result = await worksheetCollection.deleteOne({
-            _id: new ObjectId(req.params.id)
-        });
-        if (result.deletedCount === 0) {
-            return res.status(404).json({ error: 'Entry not found' });
-        }
-        res.status(200).json({ message: 'Entry deleted successfully' });
-    } catch (error) {
-        console.error('Error deleting worksheet entry:', error);
-        res.status(500).json({ error: 'Internal server error' });
+app.delete('/worksheet/:id', requireAdmin, requireObjectIdParam('id'), requireDb, asyncHandler(async (req, res) => {
+    const result = await worksheetCollection.deleteOne({
+        _id: new ObjectId(req.params.id)
+    });
+    if (result.deletedCount === 0) {
+        return res.status(404).json({ error: 'Entry not found' });
     }
-});
+    res.status(200).json({ message: 'Entry deleted successfully' });
+}));
 
 // Modified salary history endpoint with pagination
-app.get('/payment-history', requireAdmin, requireDb, async (req, res) => {
-    try {
-        // Fetch all payment requests from the collection
-        const paymentHistory = await paymentRequestsCollection
-            .find()
-            .sort({ paidDate: -1 })
-            .toArray();
+app.get('/payment-history', requireAdmin, validateListQuery, requireDb, asyncHandler(async (req, res) => {
+    const paymentHistory = await paymentRequestsCollection
+        .find()
+        .sort({ paidDate: -1 })
+        .limit(parseLimit(req.query.limit))
+        .toArray();
 
-        res.status(200).json({
-            payments: paymentHistory,
-            totalEntries: paymentHistory.length
-        });
-    } catch (error) {
-        console.error('Error fetching payment history:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json({
+        payments: paymentHistory,
+        totalEntries: paymentHistory.length
+    });
+}));
 
 // Returns total of emplyee with email: email
-app.get('/payment-history/:email', requireDb, async (req, res) => {
-    try {
-        const { email } = req.params; // Get email from the URL parameter
+app.get('/payment-history/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+    const { email } = req.params;
 
-        if (!email) {
-            return res.status(400).json({ error: 'Email is required' }); // Return error if email is not provided
-        }
+    // Fetch payment history filtered by email
+    const paymentHistory = await paymentRequestsCollection
+        .find({ email })
+        .sort({ paidDate: -1 })
+        .limit(INTERNAL_FETCH_CAP)
+        .toArray();
 
-        // Fetch payment history filtered by email
-        const paymentHistory = await paymentRequestsCollection
-            .find({ email }) // Filter by email
-            .sort({ paidDate: -1 })
-            .toArray(); // Ensure toArray() is called to return an array
-
-        if (!paymentHistory || paymentHistory.length === 0) {
-            return res.status(404).json({ error: 'No payment history found for this email' });
-        }
-
-        // Transform the payment history into the desired format
-        const salaryHistory = paymentHistory.map(payment => {
-            // Extract month and year from paidDate
-            const paidDate = new Date(payment.paidDate);
-            const month = paidDate.toLocaleString('default', { month: 'long' });
-            const year = paidDate.getFullYear();
-
-            // Combine month and year for unique month-key
-            const monthKey = `${month}-${year}`;
-
-            // You can accumulate the total amount for the month if there are multiple payments in the same month
-            return {
-                month: monthKey,
-                salary: payment.amount, // The amount paid as the salary for this entry
-                approvedBy: payment.paidBy
-            };
-        });
-
-        // Group the payments by month (if multiple payments in the same month)
-        const groupedSalaryHistory = salaryHistory.reduce((acc, curr) => {
-            const existing = acc.find(item => item.month === curr.month);
-            if (existing) {
-                existing.salary += curr.salary; // Accumulate salary for the same month
-            } else {
-                acc.push(curr); // Add new month entry
-            }
-            return acc;
-        }, []);
-
-        // Return the transformed payment history data
-        res.status(200).json({
-            payments: groupedSalaryHistory,
-            totalEntries: groupedSalaryHistory.length
-        });
-    } catch (error) {
-        console.error('Error fetching payment history:', error);
-        res.status(500).json({ error: 'Internal server error' });
+    if (!paymentHistory || paymentHistory.length === 0) {
+        return res.status(404).json({ error: 'No payment history found for this email' });
     }
-});
+
+    // Transform the payment history into the desired format
+    const salaryHistory = paymentHistory.map(payment => {
+        const paidDate = new Date(payment.paidDate);
+        const month = paidDate.toLocaleString('default', { month: 'long' });
+        const year = paidDate.getFullYear();
+        const monthKey = `${month}-${year}`;
+
+        return {
+            month: monthKey,
+            salary: payment.amount,
+            approvedBy: payment.paidBy
+        };
+    });
+
+    // Group the payments by month (if multiple payments in the same month)
+    const groupedSalaryHistory = salaryHistory.reduce((acc, curr) => {
+        const existing = acc.find(item => item.month === curr.month);
+        if (existing) {
+            existing.salary += curr.salary;
+        } else {
+            acc.push(curr);
+        }
+        return acc;
+    }, []);
+
+    res.status(200).json({
+        payments: groupedSalaryHistory,
+        totalEntries: groupedSalaryHistory.length
+    });
+}));
 
 // Returns array of payments for this employee
-app.get('/payment-historya/:email', requireDb, async (req, res) => {
-    try {
-        const { email } = req.params; // Get email from the URL parameter
+app.get('/payment-historya/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+    const { email } = req.params;
 
-        if (!email) {
-            return res.status(400).json({ error: 'Email is required' }); // Return error if email is not provided
-        }
+    const paymentHistory = await paymentRequestsCollection
+        .find({ email })
+        .sort({ paidDate: -1 })
+        .limit(INTERNAL_FETCH_CAP)
+        .toArray();
 
-        // Fetch payment history filtered by email
-        const paymentHistory = await paymentRequestsCollection
-            .find({ email }) // Filter by email
-            .sort({ paidDate: -1 })
-            .toArray();
-
-        res.status(200).json({
-            payments: paymentHistory,
-            totalEntries: paymentHistory.length
-        });
-    } catch (error) {
-        console.error('Error fetching payment history:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json({
+        payments: paymentHistory,
+        totalEntries: paymentHistory.length
+    });
+}));
 
 // New endpoint to get total amount owed to employee (worksheetcollection)
-app.get('/employee-owed/:email', requireDb, async (req, res) => {
-    try {
-        const { email } = req.params;
+app.get('/employee-owed/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+    const { email } = req.params;
 
-        // Get all worksheet entries
-        const worksheetEntries = await worksheetCollection.find({
-            email: email
-        }).toArray();
+    // Get all worksheet entries
+    const worksheetEntries = await worksheetCollection.find({
+        email: email
+    }).limit(INTERNAL_FETCH_CAP).toArray();
 
-        // Get all payment history
-        const paymentHistory = await paymentRequestsCollection.find({
-            email: email
-        }).toArray();
+    // Get all payment history
+    const paymentHistory = await paymentRequestsCollection.find({
+        email: email
+    }).limit(INTERNAL_FETCH_CAP).toArray();
 
-        // Check for pending payments
-        const pendingPayment = await paymentRequestsCollection.findOne({
-            email: email,
-            status: 'pending'
-        });
+    // Check for pending payments
+    const pendingPayment = await paymentRequestsCollection.findOne({
+        email: email,
+        status: 'pending'
+    });
 
-        // Calculate total hours worked
-        const totalHours = worksheetEntries.reduce((acc, entry) => {
-            return acc + Number(entry.hoursWorked);
-        }, 0);
+    // Calculate total hours worked
+    const totalHours = worksheetEntries.reduce((acc, entry) => {
+        return acc + Number(entry.hoursWorked);
+    }, 0);
 
-        // Get paid entries IDs from payment history
-        const paidEntryIds = paymentHistory
-            .filter(payment => payment.status === 'paid')
-            .flatMap(payment => payment.entries || [])
-            .map(entry => entry._id.toString());
+    // Get paid entries IDs from payment history
+    const paidEntryIds = paymentHistory
+        .filter(payment => payment.status === 'paid')
+        .flatMap(payment => payment.entries || [])
+        .map(entry => entry._id.toString());
 
-        // Calculate total paid amount
-        const totalPaid = paymentHistory
-            .filter(payment => payment.status === 'paid')
-            .reduce((acc, payment) => acc + Number(payment.amount), 0);
+    // Calculate total paid amount
+    const totalPaid = paymentHistory
+        .filter(payment => payment.status === 'paid')
+        .reduce((acc, payment) => acc + Number(payment.amount), 0);
 
-        // Calculate amount owed (only from unpaid entries)
-        const totalOwed = (worksheetEntries
-            .filter(entry => !paidEntryIds.includes(entry._id.toString()))
-            .reduce((acc, entry) => acc + (Number(entry.hoursWorked) * 20), 0)) - totalPaid;
+    // Calculate amount owed (only from unpaid entries)
+    const totalOwed = (worksheetEntries
+        .filter(entry => !paidEntryIds.includes(entry._id.toString()))
+        .reduce((acc, entry) => acc + (Number(entry.hoursWorked) * 20), 0)) - totalPaid;
 
-        // Get the latest paid payment for salary
-        const latestPaidPayment = paymentHistory
-            .filter(payment => payment.status === 'paid')
-            .sort((a, b) => new Date(b.paidDate) - new Date(a.paidDate))[0];
+    // Get the latest paid payment for salary
+    const latestPaidPayment = paymentHistory
+        .filter(payment => payment.status === 'paid')
+        .sort((a, b) => new Date(b.paidDate) - new Date(a.paidDate))[0];
 
-        const salary = latestPaidPayment ? latestPaidPayment.amount : 0;
+    const salary = latestPaidPayment ? latestPaidPayment.amount : 0;
 
-        res.status(200).json({
-            totalOwed,
-            totalHours,
-            totalPaid,
-            salary,
-            hasPendingPayment: !!pendingPayment,
-            worksheetEntries: worksheetEntries.filter(entry =>
-                !paidEntryIds.includes(entry._id.toString())
-            )
-        });
-    } catch (error) {
-        console.error('Error calculating employee metrics:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json({
+        totalOwed,
+        totalHours,
+        totalPaid,
+        salary,
+        hasPendingPayment: !!pendingPayment,
+        worksheetEntries: worksheetEntries.filter(entry =>
+            !paidEntryIds.includes(entry._id.toString())
+        )
+    });
+}));
 
 // Endpoint to process payment
-app.post('/process-payment', requireAdmin, requireDb, async (req, res) => {
-    const { email, amount, paidBy, entries } = req.body || {};
+app.post('/process-payment', requireAdmin, validatePaymentBody, requireDb, asyncHandler(async (req, res) => {
+    const { email, amount, paidBy, entries } = req.body;
 
-    if (typeof email !== 'string' || typeof paidBy !== 'string') {
-        return res.status(400).json({ error: 'email and paidBy must be strings' });
-    }
     const amountValue = typeof amount === 'string' && amount.trim() !== '' ? Number(amount) : amount;
-    if (typeof amountValue !== 'number' || !Number.isFinite(amountValue) || amountValue <= 0) {
-        return res.status(400).json({ error: 'amount must be a positive number' });
-    }
-    if (!Array.isArray(entries) || entries.length === 0) {
-        return res.status(400).json({ error: 'entries must be a non-empty array' });
-    }
-    if (entries.some(entry => !entry || typeof entry._id !== 'string')) {
-        return res.status(400).json({ error: 'each entry must carry a string _id' });
-    }
-
-    let entryIds;
-    try {
-        entryIds = entries.map(entry => new ObjectId(entry._id));
-    } catch (error) {
-        return res.status(400).json({ error: 'entry _id values must be valid ObjectIds' });
-    }
+    const entryIds = entries.map(entry => new ObjectId(entry._id));
 
     const session = client.startSession();
 
     try {
         // Only rows that exist and belong to the claimed employee may be deleted.
-        const owned = await worksheetCollection.find({ _id: { $in: entryIds } }).toArray();
+        const owned = await worksheetCollection.find({ _id: { $in: entryIds } }).limit(MAXLEN.entries).toArray();
         if (owned.length !== entryIds.length || owned.some(entry => entry.email !== email)) {
             return res.status(400).json({ error: 'entries do not exist or do not belong to that employee' });
         }
 
         await session.withTransaction(async () => {
-            // Create payment record
             const paymentRecord = {
                 email,
                 amount: amountValue,
                 paidBy,
                 paidDate: new Date(),
                 status: 'pending',
-                entries: entries // Store the worksheet entries that were paid
+                entries: entries
             };
 
             await paymentRequestsCollection.insertOne(paymentRecord, { session });
 
-            // Delete the paid worksheet entries
             await worksheetCollection.deleteMany(
                 { _id: { $in: entryIds }, email },
                 { session }
             );
         });
-
-        res.status(200).json({ message: 'Payment processed successfully' });
-    } catch (error) {
-        console.error('Error processing payment:', error);
-        res.status(500).json({ error: 'Failed to process payment' });
     } finally {
         await session.endSession();
     }
-});
 
-app.get('/check-pending-payment/:email', requireDb, async (req, res) => {
-    try {
-        const { email } = req.params;
+    res.status(200).json({ message: 'Payment processed successfully' });
+}));
 
-        // Find any pending payments for this employee
-        const pendingPayment = await paymentRequestsCollection.findOne({
-            email: email,
-            status: 'pending'
-        });
+app.get('/check-pending-payment/:email', requireStringParam('email', MAXLEN.email), requireDb, asyncHandler(async (req, res) => {
+    // Find any pending payments for this employee
+    const pendingPayment = await paymentRequestsCollection.findOne({
+        email: req.params.email,
+        status: 'pending'
+    });
 
-        res.status(200).json({
-            hasPendingPayment: !!pendingPayment,
-            pendingPayment: pendingPayment
-        });
-    } catch (error) {
-        console.error('Error checking pending payments:', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    res.status(200).json({
+        hasPendingPayment: !!pendingPayment,
+        pendingPayment: pendingPayment
+    });
+}));
 
 // Endpoint for admin to approve/reject payment requests
-app.put('/approve-payment/:paymentId', requireAdmin, requireDb, async (req, res) => {
+app.put('/approve-payment/:paymentId', requireAdmin, requireObjectIdParam('paymentId'), validateApprovePaymentBody, requireDb, asyncHandler(async (req, res) => {
     const { paymentId } = req.params;
-    const { status } = req.body || {}; // 'paid' or 'pending'
+    const { status } = req.body;
 
-    if (!['paid', 'pending'].includes(status)) {
-        return res.status(400).json({ error: 'Invalid status value. Must be "paid" or "pending".' });
+    // Existence check outside the transaction so a miss answers 404 instead of
+    // racing the final 200 (the old code could send both).
+    const paymentRequest = await paymentRequestsCollection.findOne(
+        { _id: new ObjectId(paymentId) }
+    );
+
+    if (!paymentRequest) {
+        return res.status(404).json({ error: 'Payment request not found.' });
     }
 
     const session = client.startSession();
 
     try {
-        // Start a transaction to ensure consistency
         await session.withTransaction(async () => {
-            const paymentRequest = await paymentRequestsCollection.findOne(
-                { _id: new ObjectId(paymentId) },
-                { session }
-            );
-
-            if (!paymentRequest) {
-                return res.status(404).json({ error: 'Payment request not found.' });
-            }
-
-            // Update the payment status
             await paymentRequestsCollection.updateOne(
                 { _id: new ObjectId(paymentId) },
                 { $set: { status } },
                 { session }
             );
-
-            // If payment is approved, you may also take additional actions like triggering a notification or logging.
-            if (status === 'paid') {
-                // Any logic to process once payment is approved (e.g., notify HR, employees, etc.)
-            }
         });
-
-        res.status(200).json({ message: `Payment status updated to ${status}` });
-    } catch (error) {
-        console.error('Error updating payment status:', error);
-        res.status(500).json({ error: 'Failed to update payment status.' });
     } finally {
         await session.endSession();
     }
+
+    res.status(200).json({ message: `Payment status updated to ${status}` });
+}));
+
+// ---------------------------------------------------------------------------
+// Error handler. Registered after the routes on purpose: an error handler
+// placed earlier in the stack never sees route failures.
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+    const requestId = (req && req.id) || crypto.randomUUID();
+    console.error(`[${requestId}] Error stack:`, err.stack);
+    if (res.headersSent) {
+        return next(err);
+    }
+    if (err && err.type === 'entity.parse.failed') {
+        return res.status(400).json({ error: 'Invalid JSON body', requestId });
+    }
+    const rawStatus = Number(err && (err.status || err.statusCode));
+    if (Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus < 500) {
+        return res.status(rawStatus).json({ error: 'Bad request', requestId });
+    }
+    res.status(500).json({ error: 'Internal server error', requestId });
 });
+
+// ---------------------------------------------------------------------------
+// Lifecycle. One shutdown path for SIGINT and SIGTERM so the Mongo connection
+// actually closes; the old code registered two SIGINT handlers and the second
+// one shadowed the cleanup.
+// ---------------------------------------------------------------------------
+let shuttingDown = false;
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received, closing MongoDB connection`);
+    try {
+        await client.close();
+    } catch (error) {
+        console.error('Error closing MongoDB connection:', error.message);
+    }
+    process.exit(0);
+}
+process.on('SIGINT', () => { shutdown('SIGINT'); });
+process.on('SIGTERM', () => { shutdown('SIGTERM'); });
 
 connectWithRetry();
 
@@ -938,3 +1020,8 @@ if (require.main === module) {
 }
 
 module.exports = app;
+// Pure helpers ride along for the verification script; Vercel only needs app.
+module.exports.parseLimit = parseLimit;
+module.exports.isValidObjectId = isValidObjectId;
+module.exports.asyncHandler = asyncHandler;
+module.exports.isStr = isStr;
