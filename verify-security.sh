@@ -11,6 +11,9 @@
 #   (f) security headers are present on API responses
 #   (g) rate limiting kicks in and health stays exempt
 #   (h) an async handler rejection cannot kill the process
+#   (i) single-record reads demand a Bearer ID token or x-admin-token, and the
+#       app boots without Firebase credentials
+#   (j) POST /adjust-salary/:id needs the admin token and a validated newSalary
 #
 # Usage: bash verify-security.sh   (or: npm test)
 
@@ -22,6 +25,7 @@ BASE="http://localhost:${PORT}"
 PASS=0
 FAIL=0
 SERVER_PID=""
+LOG="/tmp/worksync-verify-$$.log"
 
 check() {
     local label="$1" expected="$2" actual="$3"
@@ -67,16 +71,32 @@ body_of() {
     curl "${args[@]}" "$BASE$2"
 }
 
+bearer_status_of() {
+    # $1 = method, $2 = path, $3 = Authorization header value ('' for none),
+    # $4 = optional JSON body
+    local args=(-s -g -o /dev/null -w '%{http_code}' -X "$1" --max-time 5)
+    if [ -n "${3:-}" ]; then
+        args+=(-H "Authorization: $3")
+    fi
+    if [ -n "${4:-}" ]; then
+        args+=(-H 'Content-Type: application/json' -d "$4")
+    fi
+    curl "${args[@]}" "$BASE$2"
+}
+
 start_server() {
     # $1 = ADMIN_TOKEN value (empty disables the admin routes)
     # remaining args = extra KEY=VAL environment pairs for this run
     local admin="$1"
     shift
-    # env execs node, so $! is the server process itself.
+    # env execs node, so $! is the server process itself. The Firebase
+    # credential variables are cleared so every run proves the
+    # no-credentials boot path, whatever the calling shell has set.
     env PORT="$PORT" DB_USER=x DB_PW=y ADMIN_TOKEN="$admin" \
-        GOOGLE_APPLICATION_CREDENTIALS= "$@" \
+        GOOGLE_APPLICATION_CREDENTIALS= FIREBASE_SERVICE_ACCOUNT= \
+        GOOGLE_CLOUD_PROJECT= GCLOUD_PROJECT= "$@" \
         node "$DIR/index.js" \
-        >"/tmp/worksync-verify-$$.log" 2>&1 &
+        >"$LOG" 2>&1 &
     SERVER_PID=$!
     local i
     for i in $(seq 1 50); do
@@ -86,7 +106,7 @@ start_server() {
         sleep 0.2
     done
     echo "FAIL  server did not boot; log follows"
-    cat "/tmp/worksync-verify-$$.log"
+    cat "$LOG"
     exit 1
 }
 
@@ -121,15 +141,21 @@ assert.strictEqual(app.isValidObjectId('507f1f77bcf86cd79943901'), false);
 assert.strictEqual(app.isValidObjectId(123), false);
 let nextErr = null;
 app.asyncHandler(async () => { throw new Error('boom'); })({}, {}, (e) => { nextErr = e; });
+assert.strictEqual(app.isSelfMatch('a@b.c', 'A@B.C', 'email'), true);
+assert.strictEqual(app.isSelfMatch('a@b.c', 'x@y.z', 'email'), false);
+assert.strictEqual(app.isSelfMatch('u1', 'u1', 'uid'), true);
+assert.strictEqual(app.isSelfMatch('u1', 'u2', 'uid'), false);
+assert.strictEqual(app.isSelfMatch(undefined, 'u1', 'uid'), false);
+assert.strictEqual(app.isSelfMatch('u1', undefined, 'uid'), false);
 setImmediate(() => {
   assert.ok(nextErr && nextErr.message === 'boom');
   process.exit(0);
 });
 "; then
-    echo "PASS  [ok] parseLimit / isValidObjectId / asyncHandler unit checks"
+    echo "PASS  [ok] parseLimit / isValidObjectId / asyncHandler / isSelfMatch unit checks"
     PASS=$((PASS + 1))
 else
-    echo "FAIL  [err] parseLimit / isValidObjectId / asyncHandler unit checks"
+    echo "FAIL  [err] parseLimit / isValidObjectId / asyncHandler / isSelfMatch unit checks"
     FAIL=$((FAIL + 1))
 fi
 
@@ -146,6 +172,10 @@ check "(d) POST /process-payment is blocked without ADMIN_TOKEN" \
     "503" "$(status_of POST /process-payment '' '{"email":"a@b.c","amount":1,"paidBy":"x","entries":[{"_id":"507f1f77bcf86cd799439011"}]}')"
 check "(c) POST /users is open (signup) but still rejects admin without a token" \
     "400" "$(status_of POST /users '' '{"name":"n","email":"a@b.c","uid":"u1","userType":"admin"}')"
+check "(j) POST /adjust-salary/:id is disabled without ADMIN_TOKEN" \
+    "503" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 '' '{"newSalary":5000}')"
+check "(i) the server logs that ID-token auth is disabled without credentials" \
+    "yes" "$(grep -q 'Firebase ID-token auth disabled' "$LOG" && echo yes || echo no)"
 
 stop_server
 
@@ -212,6 +242,56 @@ traversal_code="$(status_of GET '/users/..%2F..%2F' sekret-test-token)"
 check_not "(e) path-traversal uid must not answer 500" "500" "$traversal_code"
 check_not "(e) path-traversal uid must not answer 200" "200" "$traversal_code"
 
+# (i) Firebase ID-token boundary on the single-record reads: no Authorization
+# and garbage Bearer tokens must answer 401, the admin token must still open
+# them, and the two public writes must stay open under any Authorization.
+check "(i) GET /users/:uid with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /users/507f1f77bcf86cd799439011 '')"
+check "(i) GET /users/:uid with a garbage Bearer token is 401" \
+    "401" "$(bearer_status_of GET /users/507f1f77bcf86cd799439011 'Bearer garbage')"
+check_not "(i) garbage Bearer token must not answer 500" \
+    "500" "$(bearer_status_of GET /users/507f1f77bcf86cd799439011 'Bearer garbage')"
+check "(i) GET /check-user-status/:uid with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /check-user-status/507f1f77bcf86cd799439011 '')"
+check "(i) GET /worksheet/:email with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /worksheet/a@b.c '')"
+check "(i) GET /worksheet/:email with a garbage Bearer token is 401" \
+    "401" "$(bearer_status_of GET /worksheet/a@b.c 'Bearer garbage')"
+check "(i) GET /payment-history/:email with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /payment-history/a@b.c '')"
+check "(i) GET /payment-historya/:email with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /payment-historya/a@b.c '')"
+check "(i) GET /employee-owed/:email with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /employee-owed/a@b.c '')"
+check "(i) GET /check-pending-payment/:email with no Authorization is 401" \
+    "401" "$(bearer_status_of GET /check-pending-payment/a@b.c '')"
+check "(i) GET /users/:uid with the admin token passes auth (503 only because MongoDB is down)" \
+    "503" "$(status_of GET /users/507f1f77bcf86cd799439011 sekret-test-token)"
+check "(i) GET /worksheet/:email with the admin token passes auth (503 only because MongoDB is down)" \
+    "503" "$(status_of GET /worksheet/a@b.c sekret-test-token)"
+check "(c) POST /users stays open with a garbage Bearer token (503 db, not 401)" \
+    "503" "$(bearer_status_of POST /users 'Bearer garbage' '{"name":"n","email":"a@b.c","uid":"u1"}')"
+check "(c) POST /submit-query stays open with a garbage Bearer token (503 db, not 401)" \
+    "503" "$(bearer_status_of POST /submit-query 'Bearer garbage' '{"heading":"h","designation":"d","details":"x","email":"a@b.c"}')"
+
+# (j) POST /adjust-salary/:id: admin-gated, strictly validated newSalary.
+check "(j) adjust-salary without a token is rejected" \
+    "401" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 '' '{"newSalary":5000}')"
+check "(j) adjust-salary with a wrong token is rejected" \
+    "401" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 wrong-token '{"newSalary":5000}')"
+check "(j) adjust-salary with the token and a valid payload passes the input gates (503 db)" \
+    "503" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 sekret-test-token '{"newSalary":5000}')"
+check "(j) adjust-salary rejects a string salary" \
+    "400" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 sekret-test-token '{"newSalary":"5000"}')"
+check "(j) adjust-salary rejects a salary at or above 100000" \
+    "400" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 sekret-test-token '{"newSalary":100000}')"
+check "(j) adjust-salary rejects a negative salary" \
+    "400" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 sekret-test-token '{"newSalary":-1}')"
+check "(j) adjust-salary rejects a missing salary" \
+    "400" "$(status_of POST /adjust-salary/507f1f77bcf86cd799439011 sekret-test-token '{}')"
+check "(j) adjust-salary rejects a junk id" \
+    "400" "$(status_of POST /adjust-salary/junk sekret-test-token '{"newSalary":5000}')"
+
 # (f) security headers on every response
 hdrs="$(curl -s -D - -o /dev/null --max-time 5 "$BASE/")"
 check "(f) X-Content-Type-Options: nosniff" \
@@ -226,6 +306,8 @@ check "(f) X-Request-Id is present" \
     "yes" "$(printf '%s' "$hdrs" | grep -qi '^X-Request-Id: *[0-9a-f-]' && echo yes || echo no)"
 check "(f) CORS allows x-admin-token on preflight" \
     "yes" "$(curl -s -D - -o /dev/null --max-time 5 -X OPTIONS -H 'Origin: http://localhost:5173' -H 'Access-Control-Request-Headers: x-admin-token' "$BASE/users" | grep -qi 'Access-Control-Allow-Headers:.*x-admin-token' && echo yes || echo no)"
+check "(f) CORS allows Authorization on preflight" \
+    "yes" "$(curl -s -D - -o /dev/null --max-time 5 -X OPTIONS -H 'Origin: http://localhost:5173' -H 'Access-Control-Request-Headers: authorization' "$BASE/users" | grep -qi 'Access-Control-Allow-Headers:.*authorization' && echo yes || echo no)"
 
 # (e, code) every collection-wide find() must carry a .limit()
 limit_sites="$(grep -c '\.limit(' "$DIR/index.js" || true)"
@@ -297,8 +379,8 @@ stop_server
 echo
 echo "Results: $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
-    echo "Server log: /tmp/worksync-verify-$$.log"
+    echo "Server log: $LOG"
     exit 1
 fi
-rm -f "/tmp/worksync-verify-$$.log"
+rm -f "$LOG"
 exit 0
