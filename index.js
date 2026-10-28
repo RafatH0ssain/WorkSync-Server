@@ -343,15 +343,24 @@ function requireUserOrAdmin(req, res, next) {
 }
 
 // Own-record gate for the single-record reads. A caller who got in with an ID
-// token reads only their own record; admin-token callers read any record.
+// token reads their own record; a caller whose stored userType is `hr` or
+// `admin` may read anyone's; admin-token callers read any record. The role is
+// always the server's own record, never a client claim.
 function requireSelf(field) {
-    return (req, res, next) => {
+    return asyncHandler(async (req, res, next) => {
         if (req.adminCall) return next();
-        if (!isSelfMatch(req.params[field], req.user && req.user[field], field)) {
-            return res.status(403).json({ error: 'Forbidden' });
-        }
-        next();
-    };
+        const requested = req.params[field];
+        const callerValue = req.user && req.user[field];
+        if (isSelfMatch(requested, callerValue, field)) return next();
+
+        const db = client.db('WorkSync');
+        const users = db.collection('Users');
+        const caller = await users.findOne({ uid: req.user.uid });
+        const role = caller && caller.userType;
+        if (role === 'hr' || role === 'admin') return next();
+
+        return res.status(403).json({ error: 'Forbidden' });
+    });
 }
 
 // ---------------------------------------------------------------------------
