@@ -5,6 +5,7 @@ const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 
 const app = express();
+app.disable('x-powered-by');
 const port = process.env.PORT || 5000;
 
 // ---------------------------------------------------------------------------
@@ -102,7 +103,7 @@ function makeRateLimiter(windowMs, max) {
 
 // ---------------------------------------------------------------------------
 // MongoDB connection string. MONGO_URI wins; otherwise the credentials are
-// stitched together. MONGO_CLUSTER replaces the hardcoded Atlas hostname.
+// stitched together. MONGO_CLUSTER overrides the default Atlas host below.
 // ---------------------------------------------------------------------------
 const uri = process.env.MONGO_URI
     || `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PW}@${process.env.MONGO_CLUSTER || 'cluster0.oyqb2.mongodb.net'}/?retryWrites=true&w=majority&appName=Cluster0`;
