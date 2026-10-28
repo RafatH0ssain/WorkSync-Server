@@ -55,7 +55,7 @@ What the boundary enforces on specific routes:
 - `POST /worksheet` and `PUT /worksheet/:id` accept only the fields the app uses (`task`, `hoursWorked`, `date`, `userId`, `email`).
 - `POST /adjust-salary/:id` returns 501 Not Implemented. It stays unimplemented on purpose until it can be reviewed.
 
-Open routes are the two public writes `POST /users` (signup) and `POST /submit-query` (contact form), the single-record reads the client needs for its own pages (`GET /users/:uid`, `GET /worksheet/:email`, and the other per-employee lookups), plus `GET /`. Anyone who knows an employee's email or uid can still read that one employee's data through them. Closing that needs real per-user auth.
+Open routes are the two public writes `POST /users` (signup) and `POST /submit-query` (contact form), the single-record reads the client needs for its own pages (`GET /users/:uid`, `GET /worksheet/:email`, and the other per-employee lookups), plus `GET /`. Anyone who knows an employee's email or uid can read that one employee's data through them.
 
 Error responses carry a generic message and a `requestId`. The real error goes to the server log, keyed by the same id. Every response also carries `X-Request-Id`, and each request is logged on completion with its method, path, status and duration.
 
@@ -147,12 +147,6 @@ POST /worksheet
 - an async handler rejection answers 500 and leaves the process alive
 
 It needs `node` and `curl`.
-
-## Out of scope
-
-No per-user authentication or authorization. The `x-admin-token` header is one shared secret for the whole admin surface, not a user identity, and the open single-record reads still expose one employee's data to anyone who knows their email or uid. Server-side role checks that verify real user tokens are a known gap.
-
-Signup (`POST /users`) and the contact form (`POST /submit-query`) are open by design so the deployed demo works for visitors. Both are still validated; registration can only create `employee` records. Everything else that writes is behind `x-admin-token`.
 
 ## License
 
